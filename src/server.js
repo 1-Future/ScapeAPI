@@ -807,26 +807,59 @@ commands.register('replays', { help: 'List session recordings', category: 'Gener
   }
 });
 
-// Active replays: ws → interval
+// Step-through replays: ws → { entries, idx, currentTick }
 const activeReplays = new Map();
 
-commands.register('replay', { help: 'Real-time session playback: replay [number]', category: 'General',
+function replayNext(ws) {
+  const replay = activeReplays.get(ws);
+  if (!replay) return;
+
+  const { entries } = replay;
+  if (replay.idx >= entries.length) {
+    sendText(ws, '\n── Replay complete ──');
+    activeReplays.delete(ws);
+    return;
+  }
+
+  // Show all entries for the current tick
+  const currentTick = entries[replay.idx].tick;
+  while (replay.idx < entries.length && entries[replay.idx].tick === currentTick) {
+    const e = entries[replay.idx];
+    if (e.type === 'in') {
+      sendText(ws, `[tick ${e.tick}] > ${e.text}`);
+    } else if (e.type === 'out') {
+      sendText(ws, `[tick ${e.tick}]   ${e.text}`);
+    } else if (e.type === 'end') {
+      sendText(ws, '\n── Replay complete ──');
+      activeReplays.delete(ws);
+      return;
+    }
+    replay.idx++;
+  }
+
+  // Show progress
+  if (replay.idx < entries.length) {
+    const remaining = entries.length - replay.idx;
+    sendText(ws, `    ── [${remaining} entries left — press Enter to continue, type "q" to stop] ──`);
+  } else {
+    sendText(ws, '\n── Replay complete ──');
+    activeReplays.delete(ws);
+  }
+}
+
+commands.register('replay', { help: 'Step-through replay: replay [number]', category: 'General',
   fn: (p, args) => {
     if (!fs.existsSync(LOGS_DIR)) return 'No recordings yet.';
     const files = fs.readdirSync(LOGS_DIR).filter(f => f.endsWith('.jsonl')).sort().reverse();
     const idx = parseInt(args[0]);
     if (isNaN(idx) || idx < 0 || idx >= files.length) return `Usage: replay [0-${files.length - 1}]`;
 
-    // Find this player's ws
     let playerWs = null;
     for (const [ws, pl] of players) { if (pl === p) { playerWs = ws; break; } }
     if (!playerWs) return 'Error finding connection.';
 
     // Stop any active replay
-    if (activeReplays.has(playerWs)) {
-      clearInterval(activeReplays.get(playerWs));
-      activeReplays.delete(playerWs);
-    }
+    activeReplays.delete(playerWs);
 
     // Parse recording
     const lines = fs.readFileSync(path.join(LOGS_DIR, files[idx]), 'utf8').trim().split('\n');
@@ -834,37 +867,12 @@ commands.register('replay', { help: 'Real-time session playback: replay [number]
     if (!entries.length) return 'Empty recording.';
 
     const lastTick = entries[entries.length - 1].tick;
-    sendText(playerWs, `── Replay: ${files[idx]} ── (${lastTick} ticks, ~${(lastTick * 0.6).toFixed(0)}s)\n`);
+    sendText(playerWs, `── Replay: ${files[idx]} ── (${lastTick} ticks, ~${(lastTick * 0.6).toFixed(0)}s)`);
+    sendText(playerWs, '    Press Enter to step through. Type "q" to stop.\n');
 
-    // Play back at tick speed
-    let replayTick = 0;
-    let entryIdx = 0;
-    const interval = setInterval(() => {
-      // Emit all entries for this tick
-      while (entryIdx < entries.length && entries[entryIdx].tick <= replayTick) {
-        const e = entries[entryIdx];
-        if (e.type === 'in') {
-          sendText(playerWs, `[tick ${e.tick}] > ${e.text}`);
-        } else if (e.type === 'out') {
-          sendText(playerWs, `[tick ${e.tick}]   ${e.text}`);
-        } else if (e.type === 'end') {
-          sendText(playerWs, `\n── Replay complete ──`);
-          clearInterval(interval);
-          activeReplays.delete(playerWs);
-          return;
-        }
-        entryIdx++;
-      }
-      replayTick++;
-      if (entryIdx >= entries.length) {
-        sendText(playerWs, `\n── Replay complete ──`);
-        clearInterval(interval);
-        activeReplays.delete(playerWs);
-      }
-    }, 600); // One tick = 600ms
-
-    activeReplays.set(playerWs, interval);
-    return ''; // Initial message already sent
+    activeReplays.set(playerWs, { entries, idx: 0 });
+    replayNext(playerWs);
+    return '';
   }
 });
 
@@ -872,7 +880,6 @@ commands.register('stopreplay', { help: 'Stop active replay', category: 'General
   fn: (p) => {
     for (const [ws, pl] of players) {
       if (pl === p && activeReplays.has(ws)) {
-        clearInterval(activeReplays.get(ws));
         activeReplays.delete(ws);
         return 'Replay stopped.';
       }
@@ -1018,6 +1025,18 @@ wss.on('connection', (ws) => {
 
   ws.on('message', (data) => {
     const input = data.toString().trim();
+
+    // If in replay mode, any input advances (Enter/space), "q" stops
+    if (activeReplays.has(ws)) {
+      if (input === 'q' || input === 'quit' || input === 'stopreplay') {
+        activeReplays.delete(ws);
+        sendText(ws, 'Replay stopped.');
+      } else {
+        replayNext(ws);
+      }
+      return;
+    }
+
     if (!input) return;
 
     let p = players.get(ws);

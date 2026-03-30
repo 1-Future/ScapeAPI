@@ -12,8 +12,8 @@ function ensureDir() {
 }
 
 function save(filename, data) {
-  ensureDir();
   const filepath = path.join(DATA_DIR, filename);
+  fs.mkdirSync(path.dirname(filepath), { recursive: true });
   fs.writeFileSync(filepath, JSON.stringify(data, null, 2));
 }
 
