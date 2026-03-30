@@ -26,6 +26,15 @@ const { createPlayer, combatLevel, getLevel, getXp, addXp, totalLevel,
 // Combat
 const combat = require('./combat/combat');
 
+// Data systems
+const items = require('./data/items');
+const recipes = require('./data/recipes');
+const shopSystem = require('./data/shops');
+const questSystem = require('./data/quests');
+const droptables = require('./data/droptables');
+const slayerSystem = require('./data/slayer');
+const registerAllCommands = require('./commands/all');
+
 // ── State ─────────────────────────────────────────────────────────────────────
 const PORT = 2223;
 const players = new Map(); // ws → player
@@ -156,11 +165,24 @@ function combatTick(currentTick) {
       p.busy = false;
       msg += ` The ${npc.name} is dead!`;
 
-      // Drop loot
-      const drops = npcs.rollDrops(npc);
+      // Drop loot (use drop tables if defined, fallback to NPC inline drops)
+      const drops = droptables.tables.has(npc.defId) ? droptables.roll(npc.defId) : npcs.rollDrops(npc);
       for (const drop of drops) {
         groundItems.push({ id: nextItemId++, ...drop, x: npc.x, y: npc.y, layer: npc.layer, owner: p.id, despawnTick: currentTick + 200 });
         msg += `\n  Loot: ${drop.name} x${drop.count}`;
+      }
+
+      // Slayer task tracking
+      if (p.slayerTask && npc.name.toLowerCase() === p.slayerTask.monster.toLowerCase()) {
+        p.slayerTask.remaining--;
+        if (p.slayerTask.remaining <= 0) {
+          const slayResult = slayerSystem.completeTask(p);
+          addXp(p, 'slayer', npc.maxHp); // slayer XP = monster HP
+          msg += `\n  Slayer task complete! +${slayResult.points} points (streak: ${slayResult.streak})`;
+        } else {
+          addXp(p, 'slayer', npc.maxHp);
+          msg += `\n  Slayer: ${p.slayerTask.remaining} remaining`;
+        }
       }
 
       // Combat XP
@@ -910,6 +932,77 @@ function createDefaultContent() {
   npcs.spawnNpc('cow', 109, 101);
   npcs.spawnNpc('goblin', 95, 96);
   npcs.spawnNpc('goblin', 94, 97);
+
+  // More monsters
+  npcs.defineNpc('hill_giant', { name: 'Hill Giant', examine: 'A very large humanoid.', combat: 28, maxHp: 35, stats: { attack: 18, strength: 22, defence: 26, def_slash: 18 }, maxHit: 4, attackSpeed: 4, wanderRadius: 4, respawnTicks: 30 });
+  npcs.defineNpc('lesser_demon', { name: 'Lesser Demon', examine: 'A demon from the underworld.', combat: 82, maxHp: 79, stats: { attack: 68, strength: 67, defence: 71, def_slash: 42 }, maxHit: 8, attackSpeed: 4, wanderRadius: 3, respawnTicks: 30 });
+  npcs.defineNpc('green_dragon', { name: 'Green Dragon', examine: 'A green dragon.', combat: 79, maxHp: 75, stats: { attack: 68, strength: 66, defence: 64, def_slash: 40 }, maxHit: 8, attackSpeed: 4, wanderRadius: 3, respawnTicks: 40 });
+
+  // Hill giants area (east)
+  tiles.defineArea('giants', { name: 'Giant Plains', x1: 120, y1: 95, x2: 130, y2: 105 });
+  for (let x = 120; x <= 130; x++) for (let y = 95; y <= 105; y++) tiles.setTile(x, y, tiles.T.GRASS);
+  npcs.spawnNpc('hill_giant', 124, 100);
+  npcs.spawnNpc('hill_giant', 126, 98);
+
+  // Town area (north)
+  tiles.defineArea('town', { name: 'Town', x1: 95, y1: 85, x2: 110, y2: 95, safe: true });
+  for (let x = 95; x <= 110; x++) for (let y = 85; y <= 95; y++) tiles.setTile(x, y, tiles.T.PATH);
+
+  // Shop NPCs
+  npcs.defineNpc('shopkeeper', { name: 'Shopkeeper', examine: 'A shopkeeper.', combat: 0, maxHp: 1, wanderRadius: 2, dialogue: 'Want to see my wares? Type `shop shopkeeper`.' });
+  npcs.defineNpc('weapon_master', { name: 'Weapon Master', examine: 'A weapon dealer.', combat: 0, maxHp: 1, wanderRadius: 1, dialogue: 'Looking for a weapon? Type `shop weapon master`.' });
+  npcs.defineNpc('armour_seller', { name: 'Armour Seller', examine: 'An armour dealer.', combat: 0, maxHp: 1, wanderRadius: 1, dialogue: 'Need some protection? Type `shop armour seller`.' });
+  npcs.defineNpc('fishing_tutor', { name: 'Fishing Tutor', examine: 'A fishing instructor.', combat: 0, maxHp: 1, wanderRadius: 1, dialogue: 'Need supplies? Type `shop fishing tutor`.' });
+  npcs.defineNpc('mining_instructor', { name: 'Mining Instructor', examine: 'A mining instructor.', combat: 0, maxHp: 1, wanderRadius: 1, dialogue: 'Need a pickaxe? Type `shop mining instructor`.' });
+  npcs.defineNpc('aubury', { name: 'Aubury', examine: 'A rune shop owner.', combat: 0, maxHp: 1, wanderRadius: 1, dialogue: 'Interested in runes? Type `shop aubury`.' });
+  npcs.defineNpc('slayer_master', { name: 'Turael', examine: 'A slayer master.', combat: 0, maxHp: 1, wanderRadius: 1, dialogue: 'Need a task? Type `slayer turael`.' });
+  npcs.defineNpc('cook', { name: 'Cook', examine: 'The castle cook.', combat: 0, maxHp: 1, wanderRadius: 2, dialogue: 'I need help with a cake! Type `startquest cook`.' });
+
+  npcs.spawnNpc('shopkeeper', 98, 90);
+  npcs.spawnNpc('weapon_master', 100, 88);
+  npcs.spawnNpc('armour_seller', 102, 88);
+  npcs.spawnNpc('fishing_tutor', 96, 104);
+  npcs.spawnNpc('mining_instructor', 108, 106);
+  npcs.spawnNpc('aubury', 104, 90);
+  npcs.spawnNpc('slayer_master', 106, 90);
+  npcs.spawnNpc('cook', 100, 92);
+
+  // More gathering objects
+  objects.defineObject('maple', { name: 'Maple tree', examine: 'A maple tree.', actions: ['chop'], skill: 'woodcutting', levelReq: 45, xp: 100, ticks: 4, product: { id: 203, name: 'Maple logs', count: 1 }, depletionChance: 0.2, respawnTicks: 30 });
+  objects.defineObject('yew', { name: 'Yew tree', examine: 'A yew tree.', actions: ['chop'], skill: 'woodcutting', levelReq: 60, xp: 175, ticks: 4, product: { id: 204, name: 'Yew logs', count: 1 }, depletionChance: 0.15, respawnTicks: 50 });
+  objects.defineObject('coal_rock', { name: 'Coal rock', examine: 'A rock containing coal.', actions: ['mine'], skill: 'mining', levelReq: 30, xp: 50, ticks: 4, product: { id: 213, name: 'Coal', count: 1 }, depletionChance: 1.0, respawnTicks: 49 });
+  objects.defineObject('mithril_rock', { name: 'Mithril rock', examine: 'A rock containing mithril.', actions: ['mine'], skill: 'mining', levelReq: 55, xp: 80, ticks: 4, product: { id: 215, name: 'Mithril ore', count: 1 }, depletionChance: 1.0, respawnTicks: 200 });
+  objects.defineObject('fly_fishing_spot', { name: 'Fishing spot', examine: 'A trout/salmon spot.', actions: ['fish'], skill: 'fishing', levelReq: 20, xp: 50, ticks: 5, product: { id: 221, name: 'Raw trout', count: 1 } });
+  objects.defineObject('cage_fishing_spot', { name: 'Cage/Harpoon spot', examine: 'A lobster/swordfish spot.', actions: ['fish'], skill: 'fishing', levelReq: 40, xp: 90, ticks: 5, product: { id: 223, name: 'Raw lobster', count: 1 } });
+  objects.defineObject('range', { name: 'Cooking range', examine: 'A range for cooking.', actions: ['cook'] });
+  objects.defineObject('furnace', { name: 'Furnace', examine: 'A furnace for smelting.', actions: ['smelt'] });
+  objects.defineObject('anvil', { name: 'Anvil', examine: 'An anvil for smithing.', actions: ['smith'] });
+  objects.defineObject('bank_booth', { name: 'Bank booth', examine: 'A bank booth.', actions: ['bank'] });
+  objects.defineObject('spinning_wheel', { name: 'Spinning wheel', examine: 'A spinning wheel.', actions: ['spin'] });
+
+  // Place town objects
+  objects.placeObject('range', 99, 92);
+  objects.placeObject('furnace', 101, 92);
+  objects.placeObject('anvil', 103, 92);
+  objects.placeObject('bank_booth', 98, 88);
+  objects.placeObject('spinning_wheel', 105, 92);
+
+  // More trees
+  objects.placeObject('oak', 92, 98);
+  objects.placeObject('oak', 91, 99);
+  objects.placeObject('willow', 90, 102);
+  objects.placeObject('willow', 89, 103);
+
+  // More rocks
+  objects.placeObject('iron_rock', 110, 107);
+  objects.placeObject('coal_rock', 111, 107);
+  objects.placeObject('coal_rock', 112, 107);
+
+  // More fishing
+  objects.placeObject('fly_fishing_spot', 94, 106);
+  tiles.setTile(94, 106, tiles.T.FISH_SPOT);
+
+  console.log(`[init] Default world created with ${npcs.npcs.size} NPCs, ${objects.objects.size} objects`);
 }
 
 // ── HTTP + WebSocket Server ───────────────────────────────────────────────────
@@ -1004,6 +1097,16 @@ if (tiles.tileAt(SPAWN_X, SPAWN_Y) === tiles.T.EMPTY) {
 tick.onTick('movement', movementTick);
 tick.onTick('combat', combatTick);
 tick.onTick('world', worldTick);
+tick.onTick('shops', (t) => shopSystem.restockTick(t));
+
+// Register all Tier 6-18 commands
+registerAllCommands({
+  players, playersByName, groundItems, tick, events, persistence,
+  tiles, walls, npcs, objects, pathfinding, combat,
+  getLevel, getXp, addXp, totalLevel, combatLevel,
+  invAdd, invRemove, invCount, invFreeSlots,
+  send, sendText, broadcast, findPlayer, nextItemId,
+});
 
 // Persistence
 persistence.onSave('chunks', () => tiles.saveChunks());
