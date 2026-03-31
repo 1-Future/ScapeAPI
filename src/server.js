@@ -1193,11 +1193,20 @@ commands.register('npcs', { help: 'List nearby NPCs', category: 'World',
   }
 });
 
-commands.register('talk', { help: 'Talk to an NPC: talk [name]', category: 'World',
+commands.register('talk', { help: 'Talk to an NPC: talk [name] (or just `talk` for nearest)', category: 'World',
   fn: (p, args) => {
-    const name = args.join(' ');
-    const npc = npcs.findNpcByName(name, p.x, p.y, 5, p.layer);
-    if (!npc) return `No "${name}" nearby.`;
+    let npc;
+    if (args.length === 0) {
+      // Talk to nearest non-combat NPC
+      const nearby = npcs.getNpcsNear(p.x, p.y, 10, p.layer).filter(n => n.dialogue);
+      if (!nearby.length) return 'Nobody nearby to talk to.';
+      nearby.sort((a, b) => (Math.abs(a.x - p.x) + Math.abs(a.y - p.y)) - (Math.abs(b.x - p.x) + Math.abs(b.y - p.y)));
+      npc = nearby[0];
+    } else {
+      const name = args.join(' ');
+      npc = npcs.findNpcByName(name, p.x, p.y, 10, p.layer);
+      if (!npc) return `No "${name}" nearby. Type \`npcs\` to see who's around.`;
+    }
     if (!npc.dialogue) return `The ${npc.name} has nothing to say.`;
     return `${npc.name}: "${npc.dialogue}"`;
   }
