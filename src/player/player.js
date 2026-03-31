@@ -102,6 +102,30 @@ function createPlayer(id, name) {
     farmingPatches: {},
     // Aggro timer: { "npcDefId": firstSeenTick } — tracks when NPCs first noticed this player
     aggroTimers: {},
+
+    // ── Kill count tracking (feature 6) ──
+    killCounts: {}, // { "goblin": 5, "cow": 12, ... }
+
+    // ── Achievement system (feature 1) ──
+    achievementProgress: {}, // { "first_blood": 1, "lumberjack": 47, ... }
+    achievementsComplete: {}, // { "first_blood": true, ... }
+
+    // ── Collection log (feature 2) ──
+    collectionLog: {}, // { "boss_drops": [itemId, ...], "monster_drops": [...], "clue_rewards": [...], "skilling": [...] }
+
+    // ── Account mode (feature 3) ──
+    accountMode: null, // null = normal, 'ironman', 'hcim', 'uim'
+    modeSet: false, // true after first set, cannot change
+
+    // ── Daily challenges (feature 7) ──
+    dailyChallenge: null, // { type, target, targetName, goal, progress, reward, rewardType, rewardSkill, generatedAt }
+
+    // ── Loot tracker (feature 8) ──
+    lootTracker: {}, // { "goblin": [{ id, name, count, value }], ... }
+    lootTrackerTotal: 0, // total value this session
+
+    // ── Server start time for game clock (feature 10) ──
+    // (uses global tick)
   };
 }
 

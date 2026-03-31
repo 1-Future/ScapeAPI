@@ -291,4 +291,13 @@ define({ id: 614, name: 'Bird feather', examine: 'A colourful bird feather.', st
 
 // Antipoison potion (already exists as id 333 — Antipoison(4))
 
+// Clue scrolls & misc drops
+define({ id: 900, name: 'Clue scroll (beginner)', examine: 'A clue scroll.', value: 50, tradeable: false, category: 'clue', weight: 0 });
+define({ id: 901, name: 'Giant key', examine: 'A giant key.', value: 500, tradeable: false, category: 'boss', weight: 1 });
+
+// XP lamp (achievement reward)
+define({ id: 950, name: 'XP lamp (small)', examine: 'Grants XP in a skill of your choice.', value: 0, tradeable: false, category: 'reward', weight: 0 });
+define({ id: 951, name: 'XP lamp (medium)', examine: 'Grants XP in a skill of your choice.', value: 0, tradeable: false, category: 'reward', weight: 0 });
+define({ id: 952, name: 'XP lamp (large)', examine: 'Grants XP in a skill of your choice.', value: 0, tradeable: false, category: 'reward', weight: 0 });
+
 module.exports = { define, get, find, search, items, FOOD_HEAL };

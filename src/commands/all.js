@@ -89,6 +89,7 @@ module.exports = function registerAll(ctx) {
       const lvl = addXp(p, 'prayer', xp);
       let msg = `You bury the ${item.name}.${xpDrop('prayer', xp)}`;
       if (lvl) msg += ` Prayer level: ${lvl}!`;
+      events.emit('skill_action', { player: p, skill: 'prayer' });
       return msg;
     }
   });
@@ -179,6 +180,8 @@ module.exports = function registerAll(ctx) {
         updateWeight(pl);
         let msg = `You ${data.verb} ${r.name}.${xpDrop(data.skill, r.xp)}`;
         if (lvl) msg += ` ${data.skill.charAt(0).toUpperCase() + data.skill.slice(1)} level: ${lvl}!`;
+        // Track skilling action for achievements/dailies
+        events.emit('skill_action', { player: pl, skill: data.skill });
         // Can we repeat?
         for (const input of r.inputs) { if (invCount(pl, input.id) < input.count) { actions.cancel(pl); msg += ' You run out of materials.'; } }
         return msg;
@@ -725,6 +728,7 @@ module.exports = function registerAll(ctx) {
             const lapLvl = addXp(pl, 'agility', data.course.lapBonus);
             msg += `\nLap complete!${xpDrop('agility', data.course.lapBonus)}`;
             if (lapLvl) msg += ` Agility level: ${lapLvl}!`;
+            events.emit('skill_action', { player: pl, skill: 'agility' });
             pl.agilityLap = null;
           } else {
             msg += ` (${pl.agilityLap.obstaclesDone.size}/${data.course.obstacles.length} obstacles)`;
@@ -764,6 +768,7 @@ module.exports = function registerAll(ctx) {
         updateWeight(p);
         let msg = `You pick the ${npc.name}'s pocket. Got: ${loot.name} x${count}.${xpDrop('thieving', thieving.xp)}`;
         if (lvl) msg += ` Thieving level: ${lvl}!`;
+        events.emit('skill_action', { player: p, skill: 'thieving' });
         return msg;
       } else {
         const dmg = 1 + Math.floor(Math.random() * (thieving.stunDamage || 2));
@@ -1428,6 +1433,680 @@ module.exports = function registerAll(ctx) {
       const obj = objects.findObjectByName(name, p.x, p.y, 15, p.layer);
       if (obj) return `${obj.name}: ${obj.examine}`;
       return `Nothing called "${name}" nearby.`;
+    }
+  });
+
+  // ══════════════════════════════════════════════════════════════════════════
+  // ACHIEVEMENT SYSTEM (feature 1)
+  // ══════════════════════════════════════════════════════════════════════════
+  const ACHIEVEMENTS = {
+    first_blood: { name: 'First Blood', desc: 'Kill any NPC', goal: 1, type: 'kill_any', reward: { coins: 500 } },
+    goblin_slayer: { name: 'Goblin Slayer', desc: 'Kill 100 goblins', goal: 100, type: 'kill', target: 'goblin', reward: { coins: 5000 } },
+    lumberjack: { name: 'Lumberjack', desc: 'Chop 100 logs', goal: 100, type: 'skill_action', target: 'woodcutting', reward: { xp: { woodcutting: 5000 } } },
+    master_chef: { name: 'Master Chef', desc: 'Cook 50 food', goal: 50, type: 'skill_action', target: 'cooking', reward: { xp: { cooking: 5000 } } },
+    millionaire: { name: 'Millionaire', desc: 'Have 1,000,000 coins at once', goal: 1000000, type: 'coins', reward: { lamp: 'large' } },
+    max_combat: { name: 'Max Combat', desc: 'Reach combat level 126', goal: 126, type: 'combat_level', reward: { lamp: 'large' } },
+    total_500: { name: 'Total 500', desc: 'Reach total level 500', goal: 500, type: 'total_level', reward: { coins: 10000 } },
+    total_1000: { name: 'Total 1000', desc: 'Reach total level 1000', goal: 1000, type: 'total_level', reward: { coins: 50000 } },
+    total_1500: { name: 'Total 1500', desc: 'Reach total level 1500', goal: 1500, type: 'total_level', reward: { lamp: 'medium' } },
+    total_2000: { name: 'Total 2000', desc: 'Reach total level 2000', goal: 2000, type: 'total_level', reward: { lamp: 'large' } },
+    max_skill: { name: 'Skill Mastery', desc: 'Reach level 99 in any skill', goal: 99, type: 'any_99', reward: { lamp: 'large' } },
+    all_quests: { name: 'Quest Cape', desc: 'Complete all quests', goal: 1, type: 'all_quests', reward: { coins: 100000 } },
+    cow_killer: { name: 'Cow Killer', desc: 'Kill 50 cows', goal: 50, type: 'kill', target: 'cow', reward: { coins: 2000 } },
+    chicken_chaser: { name: 'Chicken Chaser', desc: 'Kill 25 chickens', goal: 25, type: 'kill', target: 'chicken', reward: { coins: 1000 } },
+    fisher_king: { name: 'Fisher King', desc: 'Catch 500 fish', goal: 500, type: 'skill_action', target: 'fishing', reward: { xp: { fishing: 10000 } } },
+    miner_49er: { name: 'Miner 49er', desc: 'Mine 200 ores', goal: 200, type: 'skill_action', target: 'mining', reward: { xp: { mining: 10000 } } },
+    wild_explorer: { name: 'Wild Explorer', desc: 'Reach Wilderness level 50', goal: 50, type: 'wildy_level', reward: { coins: 25000 } },
+    first_death: { name: 'A Learning Experience', desc: 'Die for the first time', goal: 1, type: 'death', reward: { coins: 100 } },
+    pickpocket_100: { name: 'Sticky Fingers', desc: 'Pick 100 pockets', goal: 100, type: 'skill_action', target: 'thieving', reward: { xp: { thieving: 5000 } } },
+    hill_giant_hunter: { name: 'Giant Hunter', desc: 'Kill 50 hill giants', goal: 50, type: 'kill', target: 'hill giant', reward: { coins: 15000 } },
+    demon_slayer: { name: 'Demon Slayer', desc: 'Kill 25 lesser demons', goal: 25, type: 'kill', target: 'lesser demon', reward: { coins: 25000 } },
+    dragon_slayer_ach: { name: 'Dragon Slayer', desc: 'Kill 10 green dragons', goal: 10, type: 'kill', target: 'green dragon', reward: { coins: 50000 } },
+    bone_collector: { name: 'Bone Collector', desc: 'Bury 200 bones', goal: 200, type: 'skill_action', target: 'prayer', reward: { xp: { prayer: 5000 } } },
+    smith_100: { name: 'Hammer Time', desc: 'Smith 100 items', goal: 100, type: 'skill_action', target: 'smithing', reward: { xp: { smithing: 5000 } } },
+    craft_master: { name: 'Craft Master', desc: 'Craft 100 items', goal: 100, type: 'skill_action', target: 'crafting', reward: { xp: { crafting: 5000 } } },
+    fire_starter: { name: 'Fire Starter', desc: 'Light 50 fires', goal: 50, type: 'skill_action', target: 'firemaking', reward: { xp: { firemaking: 3000 } } },
+    guard_robber: { name: 'Guard Robber', desc: 'Kill 25 guards', goal: 25, type: 'kill', target: 'guard', reward: { coins: 5000 } },
+    slayer_10: { name: 'Slayer Apprentice', desc: 'Complete 10 slayer tasks', goal: 10, type: 'slayer_tasks', reward: { xp: { slayer: 5000 } } },
+    skeleton_basher: { name: 'Skeleton Basher', desc: 'Kill 50 skeletons', goal: 50, type: 'kill', target: 'skeleton', reward: { coins: 5000 } },
+    zombie_slayer: { name: 'Zombie Slayer', desc: 'Kill 50 zombies', goal: 50, type: 'kill', target: 'zombie', reward: { coins: 5000 } },
+    agility_runner: { name: 'Agility Runner', desc: 'Complete 25 agility laps', goal: 25, type: 'skill_action', target: 'agility', reward: { xp: { agility: 5000 } } },
+    herb_collector: { name: 'Herb Collector', desc: 'Clean 50 herbs', goal: 50, type: 'skill_action', target: 'herblore', reward: { xp: { herblore: 3000 } } },
+  };
+
+  function checkAchievement(p, achieveId, currentValue) {
+    if (!p.achievementsComplete) p.achievementsComplete = {};
+    if (!p.achievementProgress) p.achievementProgress = {};
+    if (p.achievementsComplete[achieveId]) return null;
+    const ach = ACHIEVEMENTS[achieveId];
+    if (!ach) return null;
+    p.achievementProgress[achieveId] = Math.max(p.achievementProgress[achieveId] || 0, currentValue);
+    if (p.achievementProgress[achieveId] >= ach.goal) {
+      p.achievementsComplete[achieveId] = true;
+      // Award reward
+      let rewardMsg = '';
+      if (ach.reward.coins) {
+        const { invAdd: ia, invCount: ic } = require('../player/player');
+        invAdd(p, 101, 'Coins', ach.reward.coins, true);
+        rewardMsg = `${ach.reward.coins} coins`;
+      }
+      if (ach.reward.xp) {
+        for (const [skill, xp] of Object.entries(ach.reward.xp)) {
+          addXp(p, skill, xp);
+          rewardMsg += `${rewardMsg ? ' + ' : ''}${xp} ${skill} XP`;
+        }
+      }
+      if (ach.reward.lamp) {
+        const lampId = ach.reward.lamp === 'small' ? 950 : ach.reward.lamp === 'medium' ? 951 : 952;
+        const lampName = `XP lamp (${ach.reward.lamp})`;
+        invAdd(p, lampId, lampName, 1);
+        rewardMsg += `${rewardMsg ? ' + ' : ''}${lampName}`;
+      }
+      return `Achievement unlocked: ${ach.name}! Reward: ${rewardMsg}`;
+    }
+    return null;
+  }
+
+  // Register event listeners for achievement tracking
+  events.on('npc_kill', 'achievements_kill', (data) => {
+    const { player: p, ws, npc, killCount } = data;
+    // First Blood
+    let msg = checkAchievement(p, 'first_blood', 1);
+    if (msg) sendText(ws, msg);
+    // Monster-specific kills
+    const npcLower = npc.name.toLowerCase();
+    for (const [id, ach] of Object.entries(ACHIEVEMENTS)) {
+      if (ach.type === 'kill' && ach.target === npcLower) {
+        msg = checkAchievement(p, id, killCount);
+        if (msg) sendText(ws, msg);
+      }
+    }
+    // Check slayer tasks achievement
+    if (p.achievementProgress?._slayer_tasks) {
+      msg = checkAchievement(p, 'slayer_10', p.achievementProgress._slayer_tasks);
+      if (msg) sendText(ws, msg);
+    }
+    // Check combat level and total level achievements
+    const cb = combatLevel(p);
+    msg = checkAchievement(p, 'max_combat', cb);
+    if (msg) sendText(ws, msg);
+    const tl = totalLevel(p);
+    for (const id of ['total_500', 'total_1000', 'total_1500', 'total_2000']) {
+      msg = checkAchievement(p, id, tl);
+      if (msg) sendText(ws, msg);
+    }
+    // Check 99 in any skill
+    const { SKILLS } = require('../player/player');
+    for (const s of SKILLS) {
+      if (getLevel(p, s) >= 99) {
+        msg = checkAchievement(p, 'max_skill', 99);
+        if (msg) sendText(ws, msg);
+        break;
+      }
+    }
+    // Daily challenge kill tracking
+    if (p.dailyChallenge && p.dailyChallenge.type === 'kill' && npcLower === p.dailyChallenge.targetName) {
+      p.dailyChallenge.progress = (p.dailyChallenge.progress || 0) + 1;
+      if (p.dailyChallenge.progress >= p.dailyChallenge.goal) {
+        let dailyMsg = 'Daily Challenge complete!';
+        if (p.dailyChallenge.rewardType === 'coins') {
+          invAdd(p, 101, 'Coins', p.dailyChallenge.reward, true);
+          dailyMsg += ` Reward: ${p.dailyChallenge.reward} coins.`;
+        } else if (p.dailyChallenge.rewardType === 'xp' && p.dailyChallenge.rewardSkill) {
+          addXp(p, p.dailyChallenge.rewardSkill, p.dailyChallenge.reward);
+          dailyMsg += ` Reward: ${p.dailyChallenge.reward} ${p.dailyChallenge.rewardSkill} XP.`;
+        }
+        sendText(ws, dailyMsg);
+        p.dailyChallenge.progress = p.dailyChallenge.goal; // Mark as done
+      }
+    }
+    // Wilderness level achievement
+    if (p.y <= 55) {
+      const wildyLevel = 55 - p.y;
+      msg = checkAchievement(p, 'wild_explorer', wildyLevel);
+      if (msg) sendText(ws, msg);
+    }
+  });
+
+  events.on('player_death', 'achievements_death', (data) => {
+    const { player: p, ws } = data;
+    const msg = checkAchievement(p, 'first_death', 1);
+    if (msg) {
+      // Need to find ws for player
+      for (const [w, pl] of players) {
+        if (pl === p) { sendText(w, msg); break; }
+      }
+    }
+  });
+
+  // Hook into skilling for achievement/daily tracking via a generic approach
+  // We wrap addXp to emit skill events
+  const origAddXp = addXp;
+  // We track skilling actions via events instead of wrapping addXp
+  // The recipe system calls addXp — we use the event system to intercept
+
+  // Periodic achievement check for coins/total/combat level
+  events.on('player_move', 'achievements_move', (data) => {
+    const { player: p, ws } = data;
+    if (!p || !ws) return;
+    // Wilderness level
+    if (p.y <= 55) {
+      const wildyLevel = 55 - p.y;
+      const msg = checkAchievement(p, 'wild_explorer', wildyLevel);
+      if (msg) sendText(ws, msg);
+    }
+    // Coins check
+    const coins = invCount(p, 101);
+    if (coins >= 1000000) {
+      const msg = checkAchievement(p, 'millionaire', coins);
+      if (msg) sendText(ws, msg);
+    }
+  });
+
+  commands.register('achievements', { help: 'View achievements', aliases: ['achieve', 'ach'], category: 'General',
+    fn: (p) => {
+      if (!p.achievementsComplete) p.achievementsComplete = {};
+      if (!p.achievementProgress) p.achievementProgress = {};
+      const completed = Object.keys(p.achievementsComplete).length;
+      const total = Object.keys(ACHIEVEMENTS).length;
+      let out = `── Achievements (${completed}/${total}) ──\n`;
+      for (const [id, ach] of Object.entries(ACHIEVEMENTS)) {
+        const done = p.achievementsComplete[id];
+        const progress = p.achievementProgress[id] || 0;
+        const icon = done ? '[DONE]' : `[${progress}/${ach.goal}]`;
+        out += `  ${icon} ${ach.name} — ${ach.desc}\n`;
+      }
+      return out;
+    }
+  });
+
+  commands.register('achievement', { help: 'View achievement details: achievement [name]', category: 'General',
+    fn: (p, args) => {
+      const name = args.join(' ').toLowerCase();
+      if (!name) return 'Usage: achievement [name]. Type `achievements` to see all.';
+      const entry = Object.entries(ACHIEVEMENTS).find(([id, a]) => a.name.toLowerCase().includes(name));
+      if (!entry) return `Unknown achievement: "${name}". Type \`achievements\` to see all.`;
+      const [id, ach] = entry;
+      const done = p.achievementsComplete?.[id];
+      const progress = p.achievementProgress?.[id] || 0;
+      let out = `── ${ach.name} ──\n`;
+      out += `${ach.desc}\n`;
+      out += `Progress: ${progress}/${ach.goal} ${done ? '(COMPLETE!)' : ''}\n`;
+      let rewardStr = '';
+      if (ach.reward.coins) rewardStr += `${ach.reward.coins} coins`;
+      if (ach.reward.xp) for (const [s, x] of Object.entries(ach.reward.xp)) rewardStr += `${rewardStr ? ' + ' : ''}${x} ${s} XP`;
+      if (ach.reward.lamp) rewardStr += `${rewardStr ? ' + ' : ''}XP lamp (${ach.reward.lamp})`;
+      out += `Reward: ${rewardStr}`;
+      return out;
+    }
+  });
+
+  // ══════════════════════════════════════════════════════════════════════════
+  // COLLECTION LOG (feature 2)
+  // ══════════════════════════════════════════════════════════════════════════
+  const CLOG_CATEGORIES = {
+    monster_drops: 'Monster Drops',
+    boss_drops: 'Boss Drops',
+    clue_rewards: 'Clue Rewards',
+    skilling: 'Skilling',
+  };
+
+  commands.register('clog', { help: 'Collection log: clog [category]', aliases: ['collectionlog'], category: 'General',
+    fn: (p, args) => {
+      if (!p.collectionLog) p.collectionLog = {};
+      const cat = args.join(' ').toLowerCase().replace(/\s+/g, '_');
+      if (cat && CLOG_CATEGORIES[cat]) {
+        const entries = p.collectionLog[cat] || [];
+        let out = `── Collection Log: ${CLOG_CATEGORIES[cat]} ──\n`;
+        if (!entries.length) {
+          out += '  (none obtained)\n';
+        } else {
+          for (const itemId of entries) {
+            const def = items.get(itemId);
+            out += `  ${def ? def.name : `Item #${itemId}`}\n`;
+          }
+        }
+        out += `\nTotal: ${entries.length} unique items`;
+        return out;
+      }
+      // Show all categories
+      let out = '── Collection Log ──\n';
+      let totalItems = 0;
+      for (const [key, label] of Object.entries(CLOG_CATEGORIES)) {
+        const count = (p.collectionLog[key] || []).length;
+        totalItems += count;
+        out += `  ${label}: ${count} unique items\n`;
+      }
+      out += `\nTotal: ${totalItems} unique items. Type \`clog [category]\` for details.`;
+      out += `\nCategories: ${Object.keys(CLOG_CATEGORIES).join(', ')}`;
+      return out;
+    }
+  });
+
+  // ══════════════════════════════════════════════════════════════════════════
+  // ACCOUNT MODES (feature 3)
+  // ══════════════════════════════════════════════════════════════════════════
+  commands.register('mode', { help: 'Set account mode: mode [ironman/hcim/uim]', category: 'General',
+    fn: (p, args) => {
+      if (!args[0]) {
+        const modeName = p.accountMode === 'ironman' ? 'Ironman' : p.accountMode === 'hcim' ? 'Hardcore Ironman' : p.accountMode === 'uim' ? 'Ultimate Ironman' : 'Normal';
+        return `Account mode: ${modeName}.\nModes: ironman (no trading/GE), hcim (ironman + 1 life), uim (ironman + no bank)`;
+      }
+      if (p.modeSet) return 'Your account mode has already been set and cannot be changed.';
+      const mode = args[0].toLowerCase();
+      if (mode === 'ironman' || mode === 'im') {
+        p.accountMode = 'ironman';
+        p.modeSet = true;
+        return 'Account set to Ironman. You cannot trade, use the GE, or pick up other players\' drops.';
+      }
+      if (mode === 'hcim' || mode === 'hardcore') {
+        p.accountMode = 'hcim';
+        p.modeSet = true;
+        return 'Account set to Hardcore Ironman. Same as ironman, but your first death downgrades you to regular ironman.';
+      }
+      if (mode === 'uim' || mode === 'ultimate') {
+        p.accountMode = 'uim';
+        p.modeSet = true;
+        return 'Account set to Ultimate Ironman. Same as ironman, plus you cannot use the bank.';
+      }
+      if (mode === 'normal' || mode === 'main') {
+        p.accountMode = null;
+        p.modeSet = true;
+        return 'Account set to Normal mode.';
+      }
+      return 'Unknown mode. Options: ironman, hcim, uim, normal';
+    }
+  });
+
+  // ══════════════════════════════════════════════════════════════════════════
+  // MAGIC COMBAT COMMAND (feature 5)
+  // ══════════════════════════════════════════════════════════════════════════
+  // Override the cast command to support combat spells
+  // The existing cast command handles teleports. We extend it here.
+  const existingCast = commands.commands.get('cast');
+  if (existingCast) {
+    const origFn = existingCast.fn;
+    existingCast.fn = (p, args, raw) => {
+      const fullArgs = args.join(' ').toLowerCase();
+      // Check for "cast [spell] on [npc]" pattern
+      const onMatch = fullArgs.match(/^(.+?)\s+on\s+(.+)$/);
+      if (onMatch) {
+        const spellName = onMatch[1].trim();
+        const targetName = onMatch[2].trim();
+        const { COMBAT_SPELLS, magicAttack, magicCombatXp } = require('../combat/combat');
+        const spell = COMBAT_SPELLS[spellName];
+        if (!spell) return origFn(p, args, raw);
+        if (getLevel(p, 'magic') < spell.levelReq) return `You need Magic level ${spell.levelReq} to cast ${spellName}.`;
+        // Check runes
+        for (const rune of spell.runes) {
+          if (invCount(p, rune.id) < rune.count) {
+            const runeDef = items.get(rune.id);
+            return `You need ${rune.count}x ${runeDef ? runeDef.name : 'rune'} to cast ${spellName}.`;
+          }
+        }
+        // Find target NPC
+        const npc = npcs.findNpcByName(targetName, p.x, p.y, 10, p.layer);
+        if (!npc) return `No "${targetName}" nearby.`;
+        if (npc.combat === 0) return `You can't attack the ${npc.name}.`;
+        // Consume runes
+        for (const rune of spell.runes) invRemove(p, rune.id, rune.count);
+        updateWeight(p);
+        // Perform magic attack
+        const result = magicAttack(p, npc, spellName);
+        if (!result) return `Failed to cast ${spellName}.`;
+        npc.hp = Math.max(0, npc.hp - result.damage);
+        const xpResult = magicCombatXp(p, result.damage, result.baseXp);
+        let msg = result.hit
+          ? `You cast ${spellName} on the ${npc.name} for ${result.damage} damage.${xpDrop('magic', result.damage * 2 + result.baseXp)}`
+          : `You cast ${spellName} on the ${npc.name} but miss.${xpDrop('magic', result.baseXp)}`;
+        if (xpResult.levelUp) msg += ` Magic level: ${xpResult.levelUp.level}!`;
+        if (npc.hp <= 0) {
+          npc.dead = true;
+          npc.respawnAt = tick.getTick() + npc.respawnTicks;
+          msg += ` The ${npc.name} is dead!`;
+          // Kill count
+          if (!p.killCounts) p.killCounts = {};
+          const kcKey = npc.name.toLowerCase();
+          p.killCounts[kcKey] = (p.killCounts[kcKey] || 0) + 1;
+          // Find ws for player
+          let playerWs = null;
+          for (const [w, pl] of players) { if (pl === p) { playerWs = w; break; } }
+          events.emit('npc_kill', { player: p, ws: playerWs, npc, killCount: p.killCounts[kcKey] });
+          // Drops
+          const droptables = require('../data/droptables');
+          const drops = droptables.tables.has(npc.defId) ? droptables.roll(npc.defId) : npcs.rollDrops(npc);
+          for (const drop of drops) {
+            groundItems.push({ id: Date.now() + Math.floor(Math.random() * 10000), ...drop, x: npc.x, y: npc.y, layer: npc.layer, owner: p.id, despawnTick: tick.getTick() + 200 });
+            msg += `\n  Loot: ${drop.name} x${drop.count}`;
+          }
+        } else {
+          // NPC retaliates (set target)
+          if (npc.combat > 0) npc.target = p.id;
+        }
+        return msg;
+      }
+      // Fall through to original cast handler (teleports etc.)
+      return origFn(p, args, raw);
+    };
+    // Update help text
+    existingCast.help = 'Cast a spell: cast [spell] or cast [spell] on [npc]';
+  }
+
+  // Show available combat spells
+  commands.register('spells', { help: 'List combat spells', category: 'Magic',
+    fn: (p) => {
+      const { COMBAT_SPELLS } = require('../combat/combat');
+      let out = '── Combat Spells ──\n';
+      for (const [name, spell] of Object.entries(COMBAT_SPELLS)) {
+        const canCast = getLevel(p, 'magic') >= spell.levelReq;
+        const runes = spell.runes.map(r => `${r.count}x ${items.get(r.id)?.name || '?'}`).join(' + ');
+        out += `  ${canCast ? '+' : '-'} ${name} (lvl ${spell.levelReq}, max ${spell.maxHit}) — ${runes}\n`;
+      }
+      out += '\nUsage: cast [spell] on [npc]';
+      return out;
+    }
+  });
+
+  // ══════════════════════════════════════════════════════════════════════════
+  // KILL COUNT TRACKING (feature 6)
+  // ══════════════════════════════════════════════════════════════════════════
+  commands.register('kc', { help: 'Kill counts: kc [monster]', aliases: ['killcount'], category: 'Combat',
+    fn: (p, args) => {
+      if (!p.killCounts) p.killCounts = {};
+      const name = args.join(' ').toLowerCase();
+      if (name) {
+        const count = p.killCounts[name];
+        if (!count) return `You haven't killed any ${name}.`;
+        return `Kill count — ${name}: ${count}`;
+      }
+      const entries = Object.entries(p.killCounts).sort((a, b) => b[1] - a[1]);
+      if (!entries.length) return 'No kills recorded.';
+      let out = '── Kill Counts ──\n';
+      for (const [monster, count] of entries) {
+        out += `  ${monster}: ${count}\n`;
+      }
+      return out;
+    }
+  });
+
+  // ══════════════════════════════════════════════════════════════════════════
+  // DAILY CHALLENGES (feature 7)
+  // ══════════════════════════════════════════════════════════════════════════
+  commands.register('daily', { help: 'Show current daily challenge', aliases: ['dailychallenge'], category: 'General',
+    fn: (p) => {
+      if (!p.dailyChallenge) return 'No daily challenge active. Relog to receive one.';
+      const dc = p.dailyChallenge;
+      const done = dc.progress >= dc.goal;
+      const verb = dc.type === 'kill' ? 'Kill' : dc.type === 'cook' ? 'Cook' : dc.type === 'mine' ? 'Mine' : dc.type === 'chop' ? 'Chop' : dc.type === 'fish' ? 'Catch' : dc.type;
+      const rewardStr = dc.rewardType === 'coins' ? `${dc.reward} coins` : `${dc.reward} ${dc.rewardSkill || ''} XP`;
+      let out = `── Daily Challenge ──\n`;
+      out += `${verb} ${dc.goal} ${dc.targetName}\n`;
+      out += `Progress: ${dc.progress || 0}/${dc.goal} ${done ? '(COMPLETE!)' : ''}\n`;
+      out += `Reward: ${rewardStr}\n`;
+      const timeLeft = Math.max(0, 86400000 - (Date.now() - (dc.generatedAt || 0)));
+      const hoursLeft = Math.floor(timeLeft / 3600000);
+      const minsLeft = Math.floor((timeLeft % 3600000) / 60000);
+      out += `Resets in: ${hoursLeft}h ${minsLeft}m`;
+      return out;
+    }
+  });
+
+  // ══════════════════════════════════════════════════════════════════════════
+  // LOOT TRACKER (feature 8)
+  // ══════════════════════════════════════════════════════════════════════════
+  commands.register('loot', { help: 'Loot tracker: loot [monster]', aliases: ['loottracker'], category: 'Combat',
+    fn: (p, args) => {
+      if (!p.lootTracker) p.lootTracker = {};
+      const name = args.join(' ').toLowerCase();
+      if (name) {
+        const drops = p.lootTracker[name];
+        if (!drops || !drops.length) return `No loot recorded from ${name}.`;
+        // Aggregate drops
+        const agg = {};
+        let totalValue = 0;
+        for (const d of drops) {
+          if (!agg[d.id]) agg[d.id] = { name: d.name, count: 0, value: 0 };
+          agg[d.id].count += d.count;
+          agg[d.id].value += d.value;
+          totalValue += d.value;
+        }
+        let out = `── Loot from ${name} ──\n`;
+        for (const [, item] of Object.entries(agg)) {
+          out += `  ${item.name} x${item.count} (${item.value.toLocaleString()} gp)\n`;
+        }
+        out += `\nTotal value: ${totalValue.toLocaleString()} gp`;
+        return out;
+      }
+      // Show session total
+      const monsters = Object.keys(p.lootTracker);
+      if (!monsters.length) return 'No loot received this session.';
+      let out = `── Loot Tracker (Session) ──\n`;
+      for (const monster of monsters) {
+        const value = p.lootTracker[monster].reduce((s, d) => s + d.value, 0);
+        const count = p.lootTracker[monster].length;
+        out += `  ${monster}: ${count} drops (${value.toLocaleString()} gp)\n`;
+      }
+      out += `\nSession total: ${(p.lootTrackerTotal || 0).toLocaleString()} gp`;
+      out += '\nResets on logout.';
+      return out;
+    }
+  });
+
+  // ══════════════════════════════════════════════════════════════════════════
+  // HISCORES IMPROVEMENT (feature 9)
+  // ══════════════════════════════════════════════════════════════════════════
+  // Override existing hiscores to load offline player files too
+  const existingHiscores = commands.commands.get('hiscores');
+  if (existingHiscores) {
+    existingHiscores.fn = (p, args) => {
+      const skill = args[0]?.toLowerCase() || 'total';
+      const fs = require('fs');
+      const path = require('path');
+      const persistence = require('../engine/persistence');
+      const playersDir = path.join(persistence.DATA_DIR, 'players');
+      const allPlayers = [];
+      // Include online players
+      const onlineNames = new Set();
+      for (const pl of playersByName.values()) {
+        allPlayers.push({ name: pl.name, skills: pl.skills, online: true });
+        onlineNames.add(pl.name.toLowerCase());
+      }
+      // Load offline player saves
+      if (fs.existsSync(playersDir)) {
+        const files = fs.readdirSync(playersDir).filter(f => f.endsWith('.json'));
+        for (const file of files) {
+          const playerName = file.replace('.json', '');
+          if (onlineNames.has(playerName)) continue; // Already included from online
+          try {
+            const data = JSON.parse(fs.readFileSync(path.join(playersDir, file), 'utf8'));
+            if (data.skills) allPlayers.push({ name: data.name || playerName, skills: data.skills, online: false });
+          } catch (e) { /* skip corrupt files */ }
+        }
+      }
+      if (!allPlayers.length) return 'No hiscores data.';
+      if (skill === 'total') {
+        allPlayers.sort((a, b) => {
+          const ta = Object.values(b.skills).reduce((s, sk) => s + (sk.level || 1), 0);
+          const tb = Object.values(a.skills).reduce((s, sk) => s + (sk.level || 1), 0);
+          return ta - tb;
+        });
+        let out = '── Hiscores (Total Level) ──\n';
+        allPlayers.slice(0, 20).forEach((pl, i) => {
+          const total = Object.values(pl.skills).reduce((s, sk) => s + (sk.level || 1), 0);
+          out += `  ${i + 1}. ${pl.name}${pl.online ? ' *' : ''} — ${total}\n`;
+        });
+        out += '\n* = currently online';
+        return out;
+      }
+      if (!allPlayers[0]?.skills[skill]) return `Unknown skill: ${skill}`;
+      allPlayers.sort((a, b) => (b.skills[skill]?.xp || 0) - (a.skills[skill]?.xp || 0));
+      let out = `── Hiscores (${skill}) ──\n`;
+      allPlayers.slice(0, 20).forEach((pl, i) => {
+        out += `  ${i + 1}. ${pl.name}${pl.online ? ' *' : ''} — Level ${pl.skills[skill]?.level || 1} (${(pl.skills[skill]?.xp || 0).toLocaleString()} XP)\n`;
+      });
+      out += '\n* = currently online';
+      return out;
+    };
+  }
+
+  // ══════════════════════════════════════════════════════════════════════════
+  // TRADE / GE IRONMAN RESTRICTIONS (feature 3)
+  // ══════════════════════════════════════════════════════════════════════════
+  const existingTrade = commands.commands.get('trade');
+  if (existingTrade) {
+    const origTradeFn = existingTrade.fn;
+    existingTrade.fn = (p, args, raw) => {
+      if (p.accountMode && ['ironman', 'hcim', 'uim'].includes(p.accountMode)) {
+        return "As an ironman, you can't trade with other players.";
+      }
+      return origTradeFn(p, args, raw);
+    };
+  }
+
+  const existingGiveTo = commands.commands.get('giveto');
+  if (existingGiveTo) {
+    const origGiveToFn = existingGiveTo.fn;
+    existingGiveTo.fn = (p, args, raw) => {
+      if (p.accountMode && ['ironman', 'hcim', 'uim'].includes(p.accountMode)) {
+        return "As an ironman, you can't give items to other players.";
+      }
+      return origGiveToFn(p, args, raw);
+    };
+  }
+
+  const existingGE = commands.commands.get('ge');
+  if (existingGE) {
+    const origGEFn = existingGE.fn;
+    existingGE.fn = (p, args, raw) => {
+      if (p.accountMode && ['ironman', 'hcim', 'uim'].includes(p.accountMode)) {
+        const sub = args[0]?.toLowerCase();
+        if (sub === 'buy' || sub === 'sell') return "As an ironman, you can't use the Grand Exchange.";
+      }
+      return origGEFn(p, args, raw);
+    };
+  }
+
+  // ══════════════════════════════════════════════════════════════════════════
+  // EXAMINE SELF — add mode icon (feature 3)
+  // ══════════════════════════════════════════════════════════════════════════
+  const existingExamine = commands.commands.get('examine');
+  if (existingExamine) {
+    const origExamineFn = existingExamine.fn;
+    existingExamine.fn = (p, args, raw) => {
+      const result = origExamineFn(p, args, raw);
+      const name = args.join(' ').toLowerCase();
+      if (name === 'self' || name === 'me' || name === 'myself') {
+        const modeStr = p.accountMode === 'ironman' ? '\nAccount Mode: Ironman' : p.accountMode === 'hcim' ? '\nAccount Mode: Hardcore Ironman' : p.accountMode === 'uim' ? '\nAccount Mode: Ultimate Ironman' : '';
+        // Insert mode after first line
+        if (modeStr) return result.replace(/\n/, modeStr + '\n');
+      }
+      return result;
+    };
+  }
+
+  // ══════════════════════════════════════════════════════════════════════════
+  // SKILLING EVENT HOOKS for achievements & dailies
+  // ══════════════════════════════════════════════════════════════════════════
+  // We emit skilling events by hooking into the recipe action completion.
+  // Since the recipe system is generic, we tap into the existing startRecipeAction.
+  // We do this by wrapping the addXp function in ctx to emit events.
+
+  // ── Skill action tracking for achievements and dailies ──
+  // Called from recipe/gathering completions
+  function trackSkillingAction(p, skill) {
+    if (!p.achievementProgress) p.achievementProgress = {};
+    const key = `_action_${skill}`;
+    p.achievementProgress[key] = (p.achievementProgress[key] || 0) + 1;
+    const count = p.achievementProgress[key];
+
+    // Check skill-specific achievements
+    for (const [id, ach] of Object.entries(ACHIEVEMENTS)) {
+      if (ach.type === 'skill_action' && ach.target === skill) {
+        const msg = checkAchievement(p, id, count);
+        if (msg) {
+          for (const [w, pl] of players) { if (pl === p) { sendText(w, msg); break; } }
+        }
+      }
+    }
+
+    // Daily challenge tracking for skilling
+    if (p.dailyChallenge && p.dailyChallenge.progress < p.dailyChallenge.goal) {
+      const dc = p.dailyChallenge;
+      const typeMap = { cooking: 'cook', mining: 'mine', woodcutting: 'chop', fishing: 'fish' };
+      if (typeMap[skill] === dc.type) {
+        dc.progress = (dc.progress || 0) + 1;
+        if (dc.progress >= dc.goal) {
+          for (const [w, pl] of players) {
+            if (pl === p) {
+              let dailyMsg = 'Daily Challenge complete!';
+              if (dc.rewardType === 'coins') {
+                invAdd(p, 101, 'Coins', dc.reward, true);
+                dailyMsg += ` Reward: ${dc.reward} coins.`;
+              } else if (dc.rewardType === 'xp' && dc.rewardSkill) {
+                addXp(p, dc.rewardSkill, dc.reward);
+                dailyMsg += ` Reward: ${dc.reward} ${dc.rewardSkill} XP.`;
+              }
+              sendText(w, dailyMsg);
+              break;
+            }
+          }
+        }
+      }
+    }
+
+    // Check total/combat level achievements
+    const tl = totalLevel(p);
+    const cb = combatLevel(p);
+    for (const [w, pl] of players) {
+      if (pl === p) {
+        for (const id of ['total_500', 'total_1000', 'total_1500', 'total_2000']) {
+          const msg = checkAchievement(p, id, tl);
+          if (msg) sendText(w, msg);
+        }
+        const cbMsg = checkAchievement(p, 'max_combat', cb);
+        if (cbMsg) sendText(w, cbMsg);
+        const { SKILLS } = require('../player/player');
+        for (const s of SKILLS) {
+          if (getLevel(p, s) >= 99) {
+            const msg99 = checkAchievement(p, 'max_skill', 99);
+            if (msg99) sendText(w, msg99);
+            break;
+          }
+        }
+        break;
+      }
+    }
+  }
+
+  // Make trackSkillingAction available to the event system
+  events.on('skill_action', 'skill_tracking', (data) => {
+    trackSkillingAction(data.player, data.skill);
+  });
+
+  // ══════════════════════════════════════════════════════════════════════════
+  // XP LAMP USAGE
+  // ══════════════════════════════════════════════════════════════════════════
+  commands.register('uselamp', { help: 'Use XP lamp: uselamp [skill]', category: 'Items',
+    fn: (p, args) => {
+      const skill = (args[0] || '').toLowerCase();
+      const { SKILLS } = require('../player/player');
+      if (!SKILLS.includes(skill)) return `Usage: uselamp [skill]. Skills: ${SKILLS.join(', ')}`;
+      // Find lamp in inventory (check large, medium, small)
+      const lampIds = [952, 951, 950];
+      const lampXp = { 950: 1000, 951: 5000, 952: 15000 };
+      const lampNames = { 950: 'small', 951: 'medium', 952: 'large' };
+      for (const lid of lampIds) {
+        const slot = p.inventory.findIndex(s => s && s.id === lid);
+        if (slot >= 0) {
+          const xp = lampXp[lid];
+          p.inventory[slot] = p.inventory[slot].count > 1 ? { ...p.inventory[slot], count: p.inventory[slot].count - 1 } : null;
+          const lvl = addXp(p, skill, xp);
+          let msg = `You rub the XP lamp (${lampNames[lid]}). +${xp.toLocaleString()} ${skill} XP!`;
+          if (lvl) msg += ` ${skill} level: ${lvl}!`;
+          return msg;
+        }
+      }
+      return "You don't have any XP lamps.";
     }
   });
 };

@@ -223,12 +223,21 @@ function combatTick(currentTick) {
     const npc = npcs.getNpc(p.combatTarget);
     if (!npc || npc.dead) { p.combatTarget = null; p.busy = false; continue; }
 
-    // Check range (must be adjacent)
-    const dist = Math.abs(p.x - npc.x) + Math.abs(p.y - npc.y);
-    if (dist > 1) {
-      // Path to target
-      const path = pathfinding.findPath(p.x, p.y, npc.x, npc.y, p.layer);
-      if (path && path.length > 1) p.path = path.slice(0, -1); // Walk to adjacent
+    // Determine combat type: ranged if bow+arrows equipped
+    const isRanged = combat.hasRangedSetup(p);
+    const requiredRange = isRanged ? combat.getRangedRange(p) : 1;
+
+    // Check range
+    const dist = Math.max(Math.abs(p.x - npc.x), Math.abs(p.y - npc.y));
+    if (dist > requiredRange) {
+      // Path to target — for ranged, get within range; for melee, adjacent
+      if (isRanged) {
+        const path = pathfinding.findPath(p.x, p.y, npc.x, npc.y, p.layer);
+        if (path && path.length > requiredRange) p.path = path.slice(0, -(requiredRange));
+      } else {
+        const path = pathfinding.findPath(p.x, p.y, npc.x, npc.y, p.layer);
+        if (path && path.length > 1) p.path = path.slice(0, -1); // Walk to adjacent
+      }
       continue;
     }
 
@@ -236,7 +245,22 @@ function combatTick(currentTick) {
     if (currentTick < p.nextAttackTick) continue;
     p.nextAttackTick = currentTick + combat.getAttackSpeed(p);
 
-    const result = combat.meleeAttack(p, npc);
+    let result, combatType = 'melee';
+    if (isRanged) {
+      // Consume 1 arrow
+      const ammo = p.equipment.ammo;
+      if (!ammo || ammo.count < 1) {
+        sendText(ws, 'You have no arrows left!');
+        p.combatTarget = null; p.busy = false;
+        continue;
+      }
+      ammo.count = (ammo.count || 1) - 1;
+      if (ammo.count <= 0) delete p.equipment.ammo;
+      result = combat.rangedAttack(p, npc);
+      combatType = 'ranged';
+    } else {
+      result = combat.meleeAttack(p, npc);
+    }
     npc.hp = Math.max(0, npc.hp - result.damage);
 
     let msg = result.hit
@@ -250,11 +274,31 @@ function combatTick(currentTick) {
       p.busy = false;
       msg += ` The ${npc.name} is dead!`;
 
+      // ── Kill count tracking (feature 6) ──
+      if (!p.killCounts) p.killCounts = {};
+      const kcKey = npc.name.toLowerCase();
+      p.killCounts[kcKey] = (p.killCounts[kcKey] || 0) + 1;
+      events.emit('npc_kill', { player: p, ws, npc, killCount: p.killCounts[kcKey] });
+
       // Drop loot (use drop tables if defined, fallback to NPC inline drops)
       const drops = droptables.tables.has(npc.defId) ? droptables.roll(npc.defId) : npcs.rollDrops(npc);
       for (const drop of drops) {
         groundItems.push({ id: nextItemId++, ...drop, x: npc.x, y: npc.y, layer: npc.layer, owner: p.id, despawnTick: currentTick + 200 });
         msg += `\n  Loot: ${drop.name} x${drop.count}`;
+        // ── Loot tracker (feature 8) ──
+        if (!p.lootTracker) p.lootTracker = {};
+        if (!p.lootTracker[kcKey]) p.lootTracker[kcKey] = [];
+        const dropDef = items.get(drop.id);
+        const dropValue = (dropDef?.value || 0) * drop.count;
+        p.lootTracker[kcKey].push({ id: drop.id, name: drop.name, count: drop.count, value: dropValue });
+        p.lootTrackerTotal = (p.lootTrackerTotal || 0) + dropValue;
+        // ── Collection log (feature 2) ──
+        if (!p.collectionLog) p.collectionLog = {};
+        const clogCat = dropDef?.category === 'clue' ? 'clue_rewards' : dropDef?.category === 'boss' ? 'boss_drops' : 'monster_drops';
+        if (!p.collectionLog[clogCat]) p.collectionLog[clogCat] = [];
+        if (!p.collectionLog[clogCat].includes(drop.id) && drop.id !== 0 && drop.id !== 100 && drop.id !== 101) {
+          p.collectionLog[clogCat].push(drop.id);
+        }
       }
 
       // Slayer task tracking
@@ -264,6 +308,9 @@ function combatTick(currentTick) {
           const slayResult = slayerSystem.completeTask(p);
           addXp(p, 'slayer', npc.maxHp); // slayer XP = monster HP
           msg += `\n  Slayer task complete! +${slayResult.points} points (streak: ${slayResult.streak})`;
+          // Track slayer tasks for achievement
+          if (!p.achievementProgress) p.achievementProgress = {};
+          p.achievementProgress._slayer_tasks = (p.achievementProgress._slayer_tasks || 0) + 1;
         } else {
           addXp(p, 'slayer', npc.maxHp);
           msg += `\n  Slayer: ${p.slayerTask.remaining} remaining`;
@@ -271,12 +318,13 @@ function combatTick(currentTick) {
       }
 
       // Combat XP
-      const xpResult = combat.combatXp(p, result.damage);
+      const xpResult = combatType === 'ranged' ? combat.rangedCombatXp(p, result.damage) : combat.combatXp(p, result.damage);
       if (xpResult.levelUp) msg += `\n  Level up! ${xpResult.levelUp.skill} → ${xpResult.levelUp.level}`;
       if (xpResult.hpLevelUp) msg += `\n  Level up! hitpoints → ${xpResult.hpLevelUp.level}`;
     } else {
       // Combat XP even on non-kill hits
-      combat.combatXp(p, result.damage);
+      if (combatType === 'ranged') combat.rangedCombatXp(p, result.damage);
+      else combat.combatXp(p, result.damage);
     }
 
     sendText(ws, msg);
@@ -328,6 +376,11 @@ function combatTick(currentTick) {
             groundItems.push({ id: nextItemId++, name: item.name, count: item.count || 1, x: deathX, y: deathY, layer: deathLayer, owner: p.id, despawnTick: currentTick + 1500 });
           }
           let deathMsg = 'Oh dear, you are dead!';
+          // HCIM downgrade on death (feature 3)
+          if (p.accountMode === 'hcim') {
+            p.accountMode = 'ironman';
+            deathMsg += '\nYour Hardcore Ironman status has been lost! You are now a regular Ironman.';
+          }
           if (kept.length) deathMsg += `\nYou kept: ${kept.map(i => i.name).join(', ')}`;
           if (dropped.length) deathMsg += `\nYou lost: ${dropped.map(i => i.name).join(', ')}`;
           deathMsg += '\nYour items are at your gravestone for 15 minutes.';
@@ -576,7 +629,10 @@ commands.register('help', {
 });
 
 commands.register('tick', { help: 'Show current tick', category: 'General', fn: () => `Tick: ${tick.getTick()}` });
-commands.register('whoami', { help: 'Show your info', category: 'General', fn: (p) => `${p.name} | Combat: ${combatLevel(p)} | Pos: (${p.x}, ${p.y}) | Layer: ${p.layer} | HP: ${p.hp}/${p.maxHp}` });
+commands.register('whoami', { help: 'Show your info', category: 'General', fn: (p) => {
+  const modeIcon = p.accountMode === 'ironman' ? ' [IM]' : p.accountMode === 'hcim' ? ' [HCIM]' : p.accountMode === 'uim' ? ' [UIM]' : '';
+  return `${p.name}${modeIcon} | Combat: ${combatLevel(p)} | Pos: (${p.x}, ${p.y}) | Layer: ${p.layer} | HP: ${p.hp}/${p.maxHp}`;
+}});
 commands.register('players', { help: 'List online players', category: 'General', fn: () => {
   const list = [...playersByName.values()].map(p => `  ${p.name} (combat ${combatLevel(p)}) at (${p.x}, ${p.y})`);
   return `Online: ${list.length}\n${list.join('\n')}`;
@@ -841,6 +897,11 @@ commands.register('pickup', { help: 'Pick up an item: pickup [name]', aliases: [
       i.name.toLowerCase() === name && i.x === p.x && i.y === p.y && i.layer === p.layer
     );
     if (idx < 0) return `No "${name}" here.`;
+    // Ironman restriction: can't pick up other players' drops (feature 3)
+    if (p.accountMode && (p.accountMode === 'ironman' || p.accountMode === 'hcim' || p.accountMode === 'uim')) {
+      const gItem = groundItems[idx];
+      if (gItem.owner && gItem.owner !== p.id) return "As an ironman, you can't pick up other players' drops.";
+    }
     if (invFreeSlots(p) < 1) return 'Inventory is full.';
     const item = groundItems.splice(idx, 1)[0];
     invAdd(p, item.id, item.name, item.count);
@@ -972,6 +1033,8 @@ function startGathering(p, ws, skillName, verb, obj) {
       let msg = `You get some ${data.obj.product?.name || 'resources'}.${xpDrop(data.skillName, data.obj.xp)}`;
       if (lvl) msg += ` ${data.skillName} level: ${lvl}!`;
       if (data.obj.depleted) msg += ` The ${data.obj.name} is depleted.`;
+      // Track skilling action for achievements/dailies
+      events.emit('skill_action', { player: data.player, skill: data.skillName });
       return msg;
     },
   });
@@ -1011,6 +1074,24 @@ commands.register('mine', { help: 'Mine a rock (repeating)', category: 'Gatherin
 
 commands.register('fish', { help: 'Fish at a spot (repeating)', category: 'Gathering',
   fn: (p, args) => gatherWithWalk(p, args.join(' '), 'fishing', 'fish at', 'fishing spot')
+});
+
+// ── Game Time (feature 10) ───────────────────────────────────────────────────
+commands.register('time', { help: 'Show in-game time', category: 'General',
+  fn: () => {
+    const t = tick.getTick();
+    const DAY_TICKS = 2400; // 1 game day = 2400 ticks (24 minutes real time)
+    const dayNumber = Math.floor(t / DAY_TICKS) + 1;
+    const tickInDay = t % DAY_TICKS;
+    // Map 2400 ticks to 24 hours: each 100 ticks = 1 hour
+    const totalMinutes = Math.floor(tickInDay * 24 * 60 / DAY_TICKS);
+    let hours = Math.floor(totalMinutes / 60);
+    const minutes = totalMinutes % 60;
+    const ampm = hours >= 12 ? 'PM' : 'AM';
+    const displayHour = hours === 0 ? 12 : hours > 12 ? hours - 12 : hours;
+    const isNight = hours >= 21 || hours < 6;
+    return `In-game time: ${displayHour}:${String(minutes).padStart(2, '0')} ${ampm} (Day ${dayNumber})${isNight ? ' [Night]' : ' [Day]'}`;
+  }
 });
 
 commands.register('stop', { help: 'Stop current action', aliases: ['cancel'], category: 'General',
@@ -1150,6 +1231,8 @@ commands.register('give', { help: 'Give yourself an item: give [name] [count]', 
 // ── Banking ───────────────────────────────────────────────────────────────────
 commands.register('bank', { help: 'Open bank (near bank booth)', category: 'Items',
   fn: (p) => {
+    // UIM restriction (feature 3)
+    if (p.accountMode === 'uim') return "As an Ultimate Ironman, you can't use the bank.";
     const booth = objects.findObjectByName('bank booth', p.x, p.y, 3, p.layer);
     if (!booth) return 'You need to be near a bank booth.';
     if (!p.bank) p.bank = [];
@@ -1842,7 +1925,18 @@ wss.on('connection', (ws) => {
         Object.assign(p, saved);
         p.connected = true;
         p.path = [];
+        // Restore Sets from arrays after JSON load
+        if (Array.isArray(p.activePrayers)) p.activePrayers = new Set(p.activePrayers);
+        else if (!(p.activePrayers instanceof Set)) p.activePrayers = new Set();
       }
+
+      // Initialize new feature fields if missing (for existing saves)
+      if (!p.killCounts) p.killCounts = {};
+      if (!p.achievementProgress) p.achievementProgress = {};
+      if (!p.achievementsComplete) p.achievementsComplete = {};
+      if (!p.collectionLog) p.collectionLog = {};
+      if (!p.lootTracker) p.lootTracker = {};
+      p.lootTrackerTotal = 0; // Reset session loot tracker on login
 
       p.admin = true; // Everyone is admin for now (build mode)
       p.loginTick = tick.getTick();
@@ -1851,9 +1945,34 @@ wss.on('connection', (ws) => {
       console.log(`[join] ${name} connected`);
       startSessionLog(ws, name);
       logEntry(ws, 'in', `login ${name}`);
-      sendText(ws, `Logged in as ${name}. Combat level: ${combatLevel(p)}. Type \`help\` for commands.\nYou are at (${p.x}, ${p.y}).`);
+      const modeIcon = p.accountMode === 'ironman' ? ' [Ironman]' : p.accountMode === 'hcim' ? ' [Hardcore Ironman]' : p.accountMode === 'uim' ? ' [Ultimate Ironman]' : '';
+      sendText(ws, `Logged in as ${name}${modeIcon}. Combat level: ${combatLevel(p)}. Type \`help\` for commands.\nYou are at (${p.x}, ${p.y}).`);
+      if (!p.modeSet) sendText(ws, 'Tip: Set your account mode with `mode ironman/hcim/uim` (one-time choice).');
       sendText(ws, commands.execute(p, 'look'));
       events.emit('player_login', { player: p, ws });
+
+      // ── Daily challenge generation (feature 7) ──
+      const now = Date.now();
+      if (!p.dailyChallenge || (now - (p.dailyChallenge.generatedAt || 0)) > 86400000) {
+        // Generate a new daily challenge
+        const DAILY_TEMPLATES = [
+          { type: 'kill', targetName: 'goblin', goal: 10, reward: 500, rewardType: 'coins' },
+          { type: 'kill', targetName: 'cow', goal: 8, reward: 300, rewardType: 'coins' },
+          { type: 'kill', targetName: 'chicken', goal: 15, reward: 200, rewardType: 'coins' },
+          { type: 'cook', targetName: 'shrimps', target: 230, goal: 20, reward: 1000, rewardType: 'xp', rewardSkill: 'cooking' },
+          { type: 'cook', targetName: 'trout', target: 233, goal: 10, reward: 2000, rewardType: 'xp', rewardSkill: 'cooking' },
+          { type: 'mine', targetName: 'copper ore', target: 210, goal: 15, reward: 800, rewardType: 'xp', rewardSkill: 'mining' },
+          { type: 'mine', targetName: 'iron ore', target: 212, goal: 10, reward: 1500, rewardType: 'xp', rewardSkill: 'mining' },
+          { type: 'chop', targetName: 'logs', target: 200, goal: 30, reward: 1000, rewardType: 'xp', rewardSkill: 'woodcutting' },
+          { type: 'chop', targetName: 'oak logs', target: 201, goal: 15, reward: 1500, rewardType: 'xp', rewardSkill: 'woodcutting' },
+          { type: 'fish', targetName: 'raw shrimps', target: 220, goal: 20, reward: 800, rewardType: 'xp', rewardSkill: 'fishing' },
+          { type: 'kill', targetName: 'guard', goal: 5, reward: 1000, rewardType: 'coins' },
+          { type: 'kill', targetName: 'hill giant', goal: 5, reward: 2000, rewardType: 'coins' },
+        ];
+        const template = DAILY_TEMPLATES[Math.floor(Math.random() * DAILY_TEMPLATES.length)];
+        p.dailyChallenge = { ...template, progress: 0, generatedAt: now };
+        sendText(ws, `Daily Challenge: ${template.type === 'kill' ? 'Kill' : template.type === 'cook' ? 'Cook' : template.type === 'mine' ? 'Mine' : template.type === 'chop' ? 'Chop' : template.type} ${template.goal} ${template.targetName}. Reward: ${template.rewardType === 'coins' ? template.reward + ' coins' : template.reward + ' ' + (template.rewardSkill || '') + ' XP'}`);
+      }
       return;
     }
 
@@ -1881,6 +2000,11 @@ wss.on('connection', (ws) => {
       const saveData = { ...p };
       delete saveData.path;
       delete saveData.connected;
+      // Session-only fields (feature 8) — don't persist loot tracker
+      delete saveData.lootTracker;
+      delete saveData.lootTrackerTotal;
+      // Convert Sets to arrays for JSON serialization
+      if (saveData.activePrayers instanceof Set) saveData.activePrayers = [...saveData.activePrayers];
       persistence.save(`players/${p.name.toLowerCase()}.json`, saveData);
       playersByName.delete(p.name.toLowerCase());
       players.delete(ws);
