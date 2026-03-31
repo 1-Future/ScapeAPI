@@ -1,4 +1,4 @@
-// ── OpenScapeAPI Server ───────────────────────────────────────────────────────
+// ── ScapeAPI Server ───────────────────────────────────────────────────────
 // Command-based game engine. The game is the API.
 
 const WebSocket = require('ws');
@@ -2045,7 +2045,7 @@ function createDefaultContent() {
     drops: [{ id: 100, name: 'Bones', weight: 10, min: 1, max: 1 }, { id: 101, name: 'Coins', weight: 6, min: 10, max: 30 }],
     thieving: { level: 40, xp: 46, loot: [{ id: 101, name: 'Coins', min: 15, max: 50 }], stunDamage: 2 }
   });
-  npcs.defineNpc('hans', { name: 'Hans', examine: 'A man walking around the castle.', combat: 0, maxHp: 1, wanderRadius: 10, dialogue: 'Hello adventurer! Welcome to OpenScape.',
+  npcs.defineNpc('hans', { name: 'Hans', examine: 'A man walking around the castle.', combat: 0, maxHp: 1, wanderRadius: 10, dialogue: 'Hello adventurer! Welcome to Scape.',
     thieving: { level: 1, xp: 8, loot: [{ id: 101, name: 'Coins', min: 1, max: 3 }], stunDamage: 1 }
   });
   npcs.defineNpc('man', { name: 'Man', examine: 'A man.', combat: 2, maxHp: 7, stats: { attack: 1, strength: 1, defence: 1 }, maxHit: 1, attackSpeed: 4, wanderRadius: 5, respawnTicks: 20,
@@ -2485,13 +2485,13 @@ function createDefaultContent() {
 // ── HTTP + WebSocket Server ───────────────────────────────────────────────────
 const server = http.createServer((req, res) => {
   res.writeHead(200, { 'Content-Type': 'text/plain' });
-  res.end('OpenScapeAPI v0.1.0 — Connect via WebSocket');
+  res.end('ScapeAPI v0.1.0 — Connect via WebSocket');
 });
 
 const wss = new WebSocket.Server({ server });
 
 wss.on('connection', (ws) => {
-  sendText(ws, 'Welcome to OpenScape! Type `login [name]` to start.');
+  sendText(ws, 'Welcome to Scape! Type `login [name]` to start.');
 
   ws.on('message', (data) => {
     const input = data.toString().trim();
@@ -2787,7 +2787,7 @@ persistence.startAutoSave();
 // Start
 tick.startTicking();
 server.listen(PORT, () => {
-  console.log(`[server] OpenScapeAPI running on ws://localhost:${PORT}`);
+  console.log(`[server] ScapeAPI running on ws://localhost:${PORT}`);
   console.log(`[server] Connect with: wscat -c ws://localhost:${PORT}`);
 });
 

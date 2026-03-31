@@ -671,7 +671,7 @@ module.exports = function registerAll(ctx) {
   // ── World info ──────────────────────────────────────────────────────────────
   commands.register('world', { help: 'Show world info', category: 'General',
     fn: () => {
-      return `World 1 — OpenScape\nPlayers: ${playersByName.size}\nTick: ${tick.getTick()}\nUptime: ${Math.floor(tick.getTick() * 0.6)}s`;
+      return `World 1 — Scape\nPlayers: ${playersByName.size}\nTick: ${tick.getTick()}\nUptime: ${Math.floor(tick.getTick() * 0.6)}s`;
     }
   });
 

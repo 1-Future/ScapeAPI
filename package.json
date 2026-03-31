@@ -1,5 +1,5 @@
 {
-  "name": "openscapeapi",
+  "name": "scapeapi",
   "version": "0.1.0",
   "description": "Command-based game engine. OSRS-inspired mechanics. The game is the API.",
   "main": "src/server.js",
