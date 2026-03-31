@@ -33,6 +33,8 @@ const shopSystem = require('./data/shops');
 const questSystem = require('./data/quests');
 const droptables = require('./data/droptables');
 const slayerSystem = require('./data/slayer');
+const ge = require('./data/ge');
+const actions = require('./engine/actions');
 const registerAllCommands = require('./commands/all');
 
 // ── State ─────────────────────────────────────────────────────────────────────
@@ -118,6 +120,7 @@ function movementTick(currentTick) {
       }
     }
 
+    if (actions.isActive(p)) actions.cancel(p);
     events.emit('player_move', { player: p, ws });
   }
 
@@ -206,10 +209,46 @@ function combatTick(currentTick) {
         p.hp = Math.max(0, p.hp - npcDmg);
         if (npcDmg > 0) sendText(ws, `The ${npc.name} hits you for ${npcDmg} damage. HP: ${p.hp}/${p.maxHp}`);
         if (p.hp <= 0) {
-          sendText(ws, 'Oh dear, you are dead!');
+          actions.cancel(p);
+          // Death: keep 3 most valuable items, drop the rest
+          const deathX = p.x, deathY = p.y, deathLayer = p.layer;
+          const allItems = [];
+          for (let i = 0; i < p.inventory.length; i++) {
+            if (p.inventory[i]) {
+              const def = items.get(p.inventory[i].id);
+              allItems.push({ ...p.inventory[i], slot: i, source: 'inv', value: def?.value || 0 });
+            }
+          }
+          for (const [slot, item] of Object.entries(p.equipment)) {
+            const def = items.get(item.id);
+            allItems.push({ ...item, slot, source: 'equip', value: def?.value || 0 });
+          }
+          // Sort by value descending — keep top 3
+          allItems.sort((a, b) => b.value - a.value);
+          const kept = allItems.slice(0, 3);
+          const dropped = allItems.slice(3);
+          // Clear inventory and equipment
+          p.inventory.fill(null);
+          p.equipment = {};
+          // Re-add kept items
+          for (const item of kept) {
+            invAdd(p, item.id, item.name, item.count || 1, items.get(item.id)?.stackable);
+          }
+          // Drop lost items
+          for (const item of dropped) {
+            groundItems.push({ id: nextItemId++, name: item.name, count: item.count || 1, x: deathX, y: deathY, layer: deathLayer, owner: p.id, despawnTick: currentTick + 1500 });
+          }
+          let deathMsg = 'Oh dear, you are dead!';
+          if (kept.length) deathMsg += `\nYou kept: ${kept.map(i => i.name).join(', ')}`;
+          if (dropped.length) deathMsg += `\nYou lost: ${dropped.map(i => i.name).join(', ')}`;
+          deathMsg += '\nYour items are at your gravestone for 15 minutes.';
+          sendText(ws, deathMsg);
           p.hp = p.maxHp;
-          p.x = SPAWN_X; p.y = SPAWN_Y;
+          p.x = SPAWN_X; p.y = SPAWN_Y; p.layer = 0;
           p.combatTarget = null; p.busy = false; p.path = [];
+          p.prayerPoints = getLevel(p, 'prayer');
+          p.activePrayers.clear();
+          p.runEnergy = 10000;
           events.emit('player_death', { player: p, ws, killer: npc });
         }
       }
@@ -221,6 +260,20 @@ function combatTick(currentTick) {
 function worldTick(currentTick) {
   npcs.npcTick(currentTick);
   objects.objectTick(currentTick);
+
+  // Process tick-based actions (gathering, processing)
+  const actionMsgs = actions.processTick();
+  for (const [playerId, msgs] of actionMsgs) {
+    // Find player's ws
+    for (const [ws, p] of players) {
+      if (p.id === playerId) {
+        for (const msg of msgs) sendText(ws, msg);
+        // Clear busy if action completed
+        if (!actions.isActive(p)) { p.busy = false; p.busyAction = null; }
+        break;
+      }
+    }
+  }
 
   // Despawn ground items
   for (let i = groundItems.length - 1; i >= 0; i--) {
@@ -540,10 +593,21 @@ commands.register('equip', { help: 'Equip an item: equip [name]', aliases: ['wea
     const slot = p.inventory.findIndex(s => s && s.name.toLowerCase() === name);
     if (slot < 0) return `You don't have "${name}".`;
     const item = p.inventory[slot];
-    if (!item.slot) return `${item.name} is not equippable.`;
-    p.inventory[slot] = null;
-    const old = p.equipment[item.slot];
-    p.equipment[item.slot] = item;
+    // Look up item definition for equip slot and stats
+    const def = items.get(item.id) || items.find(item.name);
+    const equipSlot = item.equipSlot || def?.equipSlot;
+    if (!equipSlot) return `${item.name} is not equippable.`;
+    // Check requirements
+    if (def?.equipReqs) {
+      for (const [skill, level] of Object.entries(def.equipReqs)) {
+        if (getLevel(p, skill) < level) return `You need ${skill} level ${level} to equip ${item.name}.`;
+      }
+    }
+    // Merge item def stats onto the item
+    const equipItem = { id: item.id, name: item.name, count: 1, equipSlot, stats: def?.stats || item.stats || {}, speed: def?.speed || item.speed };
+    p.inventory[slot] = item.count > 1 ? { ...item, count: item.count - 1 } : null;
+    const old = p.equipment[equipSlot];
+    p.equipment[equipSlot] = equipItem;
     if (old) { invAdd(p, old.id, old.name, 1); return `Equipped ${item.name} (replaced ${old.name}).`; }
     return `Equipped ${item.name}.`;
   }
@@ -603,66 +667,89 @@ commands.register('examine', { help: 'Examine something: examine [target]', alia
   }
 });
 
-// Gathering
-commands.register('chop', { help: 'Chop a tree', category: 'Gathering',
+// ── Gathering (tick-based) ─────────────────────────────────────────────────────
+function startGathering(p, ws, skillName, verb, obj) {
+  if (obj.depleted) return `The ${obj.name} is depleted.`;
+  if (getLevel(p, skillName) < obj.levelReq) return `You need ${skillName} level ${obj.levelReq}.`;
+  if (invFreeSlots(p) < 1) return 'Your inventory is full.';
+  if (p.busy) actions.cancel(p);
+
+  actions.start(p, {
+    type: skillName,
+    ticks: obj.ticks || 4,
+    repeat: true,
+    data: { obj, skillName, verb, ws, player: p },
+    onTick: (data, ticksLeft) => {
+      if (ticksLeft === data.obj.ticks - 1) return `You ${data.verb} the ${data.obj.name}...`;
+      return null;
+    },
+    onComplete: (data) => {
+      if (data.obj.depleted) { actions.cancel(data.player); return `The ${data.obj.name} is depleted.`; }
+      if (invFreeSlots(data.player) < 1) { actions.cancel(data.player); return 'Your inventory is full. You stop.'; }
+
+      // Success roll: higher level = higher chance
+      const levelDiff = getLevel(data.player, data.skillName) - data.obj.levelReq;
+      const successChance = Math.min(0.95, 0.4 + levelDiff * 0.03);
+      if (Math.random() > successChance) return null; // Silent fail, keep trying
+
+      if (data.obj.product) {
+        const itemDef = items.get(data.obj.product.id);
+        invAdd(data.player, data.obj.product.id, data.obj.product.name, data.obj.product.count || 1, itemDef?.stackable);
+      }
+      const lvl = addXp(data.player, data.skillName, data.obj.xp);
+      if (Math.random() < data.obj.depletionChance) {
+        data.obj.depleted = true;
+        data.obj.respawnAt = tick.getTick() + data.obj.respawnTicks;
+        actions.cancel(data.player);
+      }
+      let msg = `You get some ${data.obj.product?.name || 'resources'}. +${data.obj.xp} ${data.skillName} XP.`;
+      if (lvl) msg += ` ${data.skillName} level: ${lvl}!`;
+      if (data.obj.depleted) msg += ` The ${data.obj.name} is depleted.`;
+      return msg;
+    },
+  });
+  return `You begin to ${verb} the ${obj.name}...`;
+}
+
+commands.register('chop', { help: 'Chop a tree (repeating)', category: 'Gathering',
   fn: (p, args) => {
     const name = args.join(' ') || 'tree';
     const obj = objects.findObjectByName(name, p.x, p.y, 3, p.layer);
     if (!obj) return `No "${name}" nearby.`;
     if (obj.skill !== 'woodcutting') return `You can't chop the ${obj.name}.`;
-    if (getLevel(p, 'woodcutting') < obj.levelReq) return `You need Woodcutting level ${obj.levelReq}.`;
-    if (obj.depleted) return `The ${obj.name} is depleted.`;
-    // Instant attempt for text game
-    if (Math.random() < 0.7) {
-      if (obj.product) invAdd(p, obj.product.id, obj.product.name, obj.product.count || 1);
-      const lvl = addXp(p, 'woodcutting', obj.xp);
-      if (Math.random() < obj.depletionChance) { obj.depleted = true; obj.respawnAt = tick.getTick() + obj.respawnTicks; }
-      let msg = `You chop the ${obj.name}. +${obj.xp} WC XP.`;
-      if (obj.product) msg += ` Got: ${obj.product.name}.`;
-      if (lvl) msg += ` Woodcutting level: ${lvl}!`;
-      return msg;
-    }
-    return `You swing your axe at the ${obj.name}...`;
+    let ws; for (const [w, pl] of players) { if (pl === p) { ws = w; break; } }
+    return startGathering(p, ws, 'woodcutting', 'chop', obj);
   }
 });
 
-commands.register('mine', { help: 'Mine a rock', category: 'Gathering',
+commands.register('mine', { help: 'Mine a rock (repeating)', category: 'Gathering',
   fn: (p, args) => {
     const name = args.join(' ') || 'rock';
     const obj = objects.findObjectByName(name, p.x, p.y, 3, p.layer);
     if (!obj) return `No "${name}" nearby.`;
     if (obj.skill !== 'mining') return `You can't mine the ${obj.name}.`;
-    if (getLevel(p, 'mining') < obj.levelReq) return `You need Mining level ${obj.levelReq}.`;
-    if (obj.depleted) return `The ${obj.name} is depleted.`;
-    if (Math.random() < 0.7) {
-      if (obj.product) invAdd(p, obj.product.id, obj.product.name, obj.product.count || 1);
-      const lvl = addXp(p, 'mining', obj.xp);
-      if (Math.random() < obj.depletionChance) { obj.depleted = true; obj.respawnAt = tick.getTick() + obj.respawnTicks; }
-      let msg = `You mine the ${obj.name}. +${obj.xp} Mining XP.`;
-      if (obj.product) msg += ` Got: ${obj.product.name}.`;
-      if (lvl) msg += ` Mining level: ${lvl}!`;
-      return msg;
-    }
-    return `You swing your pickaxe at the ${obj.name}...`;
+    let ws; for (const [w, pl] of players) { if (pl === p) { ws = w; break; } }
+    return startGathering(p, ws, 'mining', 'mine', obj);
   }
 });
 
-commands.register('fish', { help: 'Fish at a spot', category: 'Gathering',
+commands.register('fish', { help: 'Fish at a spot (repeating)', category: 'Gathering',
   fn: (p, args) => {
     const name = args.join(' ') || 'fishing spot';
-    const obj = objects.findObjectByName(name, p.x, p.y, 3, p.layer);
+    const obj = objects.findObjectByName(name, p.x, p.y, 5, p.layer);
     if (!obj) return `No "${name}" nearby.`;
     if (obj.skill !== 'fishing') return `You can't fish the ${obj.name}.`;
-    if (getLevel(p, 'fishing') < obj.levelReq) return `You need Fishing level ${obj.levelReq}.`;
-    if (Math.random() < 0.6) {
-      if (obj.product) invAdd(p, obj.product.id, obj.product.name, obj.product.count || 1);
-      const lvl = addXp(p, 'fishing', obj.xp);
-      let msg = `You catch a fish. +${obj.xp} Fishing XP.`;
-      if (obj.product) msg += ` Got: ${obj.product.name}.`;
-      if (lvl) msg += ` Fishing level: ${lvl}!`;
-      return msg;
-    }
-    return 'You attempt to catch a fish...';
+    let ws; for (const [w, pl] of players) { if (pl === p) { ws = w; break; } }
+    return startGathering(p, ws, 'fishing', 'fish at', obj);
+  }
+});
+
+commands.register('stop', { help: 'Stop current action', aliases: ['cancel'], category: 'General',
+  fn: (p) => {
+    if (!p.busy && !actions.isActive(p)) return 'You aren\'t doing anything.';
+    if (p.combatTarget) { p.combatTarget = null; }
+    actions.cancel(p);
+    return 'You stop what you\'re doing.';
   }
 });
 
@@ -766,11 +853,184 @@ commands.register('place', { help: 'Place object: place [defId] [x] [y]', catego
 
 commands.register('give', { help: 'Give yourself an item: give [name] [count]', category: 'Build', admin: true,
   fn: (p, args) => {
-    const name = args.slice(0, -1).join(' ') || args[0];
-    const count = parseInt(args[args.length - 1]) || 1;
+    // Parse: last arg might be count
+    let count = parseInt(args[args.length - 1]);
+    let name;
+    if (!isNaN(count) && args.length > 1) {
+      name = args.slice(0, -1).join(' ');
+    } else {
+      name = args.join(' ');
+      count = 1;
+    }
     if (!name) return 'Usage: give [item name] [count]';
-    invAdd(p, nextItemId++, name, count);
-    return `Added ${name} x${count} to inventory.`;
+    // Look up in item database
+    const def = items.find(name);
+    if (def) {
+      invAdd(p, def.id, def.name, count, def.stackable);
+      return `Added ${def.name} x${count} to inventory.`;
+    }
+    // Fuzzy search
+    const results = items.search(name);
+    if (results.length) return `Item not found. Did you mean: ${results.slice(0, 5).map(i => i.name).join(', ')}`;
+    return `Unknown item: "${name}". Use exact name from item database.`;
+  }
+});
+
+// ── Banking ───────────────────────────────────────────────────────────────────
+commands.register('bank', { help: 'Open bank (near bank booth)', category: 'Items',
+  fn: (p) => {
+    const booth = objects.findObjectByName('bank booth', p.x, p.y, 3, p.layer);
+    if (!booth) return 'You need to be near a bank booth.';
+    if (!p.bank) p.bank = [];
+    let out = `── Bank (${p.bank.length}/816) ──\n`;
+    if (!p.bank.length) out += '  (empty)\n';
+    for (let i = 0; i < p.bank.length; i++) {
+      const b = p.bank[i];
+      out += `  [${i}] ${b.name}${b.count > 1 ? ` x${b.count}` : ''}\n`;
+    }
+    out += '\nCommands: deposit [item], deposit all, withdraw [item] [count]';
+    p._bankOpen = true;
+    return out;
+  }
+});
+
+commands.register('deposit', { help: 'Deposit item: deposit [item] or deposit all', category: 'Items',
+  fn: (p, args) => {
+    if (!p._bankOpen) return 'Open the bank first with `bank`.';
+    if (!p.bank) p.bank = [];
+    if (args[0] === 'all') {
+      let deposited = 0;
+      for (let i = 0; i < p.inventory.length; i++) {
+        if (p.inventory[i]) {
+          const item = p.inventory[i];
+          const existing = p.bank.find(b => b.id === item.id);
+          if (existing) existing.count += item.count;
+          else if (p.bank.length < 816) p.bank.push({ id: item.id, name: item.name, count: item.count });
+          else { return `Bank full. Deposited ${deposited} items.`; }
+          p.inventory[i] = null;
+          deposited++;
+        }
+      }
+      return `Deposited ${deposited} items.`;
+    }
+    const name = args.join(' ').toLowerCase();
+    const slot = p.inventory.findIndex(s => s && s.name.toLowerCase() === name);
+    if (slot < 0) return `You don't have "${name}".`;
+    const item = p.inventory[slot];
+    const existing = p.bank.find(b => b.id === item.id);
+    if (existing) existing.count += item.count;
+    else if (p.bank.length < 816) p.bank.push({ id: item.id, name: item.name, count: item.count });
+    else return 'Bank is full.';
+    p.inventory[slot] = null;
+    return `Deposited ${item.name} x${item.count}.`;
+  }
+});
+
+commands.register('withdraw', { help: 'Withdraw item: withdraw [item] [count]', category: 'Items',
+  fn: (p, args) => {
+    if (!p._bankOpen) return 'Open the bank first with `bank`.';
+    if (!p.bank) p.bank = [];
+    if (invFreeSlots(p) < 1) return 'Inventory is full.';
+    const count = parseInt(args[args.length - 1]);
+    const name = (!isNaN(count) && args.length > 1 ? args.slice(0, -1) : args).join(' ').toLowerCase();
+    const amt = !isNaN(count) && args.length > 1 ? count : 1;
+    const bankIdx = p.bank.findIndex(b => b.name.toLowerCase() === name);
+    if (bankIdx < 0) return `"${name}" not in bank.`;
+    const bankItem = p.bank[bankIdx];
+    const withdrawAmt = Math.min(amt, bankItem.count);
+    const def = items.get(bankItem.id);
+    invAdd(p, bankItem.id, bankItem.name, withdrawAmt, def?.stackable);
+    bankItem.count -= withdrawAmt;
+    if (bankItem.count <= 0) p.bank.splice(bankIdx, 1);
+    return `Withdrew ${bankItem.name} x${withdrawAmt}.`;
+  }
+});
+
+// ── Grand Exchange ────────────────────────────────────────────────────────────
+commands.register('ge', { help: 'Grand Exchange: ge buy/sell/offers/collect/price', category: 'Economy',
+  fn: (p, args) => {
+    const sub = args[0]?.toLowerCase();
+    if (sub === 'buy') {
+      const name = args.slice(1, -2).join(' ');
+      const qty = parseInt(args[args.length - 2]);
+      const price = parseInt(args[args.length - 1]);
+      if (!name || isNaN(qty) || isNaN(price)) return 'Usage: ge buy [item] [quantity] [price per item]';
+      const def = items.find(name);
+      if (!def) return `Unknown item: "${name}"`;
+      const totalCost = qty * price;
+      if (invCount(p, 101) < totalCost) return `You need ${totalCost} coins. You have ${invCount(p, 101)}.`;
+      invRemove(p, 101, totalCost);
+      const offer = ge.createOffer('buy', p.id, p.name, def.id, def.name, qty, price);
+      if (!offer) return 'You have too many GE offers (max 8).';
+      let msg = `Buy offer placed: ${qty}x ${def.name} at ${price} each (${totalCost} total).`;
+      if (offer.collected > 0) msg += `\n  Instantly matched: ${offer.collected} items ready to collect.`;
+      return msg;
+    }
+    if (sub === 'sell') {
+      const name = args.slice(1, -2).join(' ');
+      const qty = parseInt(args[args.length - 2]);
+      const price = parseInt(args[args.length - 1]);
+      if (!name || isNaN(qty) || isNaN(price)) return 'Usage: ge sell [item] [quantity] [price per item]';
+      const def = items.find(name);
+      if (!def) return `Unknown item: "${name}"`;
+      if (invCount(p, def.id) < qty) return `You only have ${invCount(p, def.id)}x ${def.name}.`;
+      invRemove(p, def.id, qty);
+      const offer = ge.createOffer('sell', p.id, p.name, def.id, def.name, qty, price);
+      if (!offer) return 'You have too many GE offers (max 8).';
+      let msg = `Sell offer placed: ${qty}x ${def.name} at ${price} each.`;
+      if (offer.collectedCoins > 0) msg += `\n  Instantly sold: ${offer.collectedCoins} coins ready to collect.`;
+      return msg;
+    }
+    if (sub === 'offers') {
+      const myOffers = ge.getPlayerOffers(p.id);
+      if (!myOffers.length) return 'No active GE offers.';
+      let out = '── Grand Exchange ──\n';
+      for (const o of myOffers) {
+        const filled = o.quantity - o.remaining;
+        out += `  [${o.id}] ${o.type.toUpperCase()} ${o.quantity}x ${o.itemName} @ ${o.price}ea — ${filled}/${o.quantity} filled`;
+        if (o.collected > 0) out += ` | ${o.collected} items to collect`;
+        if (o.collectedCoins > 0) out += ` | ${o.collectedCoins} coins to collect`;
+        out += '\n';
+      }
+      out += '\nCommands: ge collect [id], ge cancel [id]';
+      return out;
+    }
+    if (sub === 'collect') {
+      const id = parseInt(args[1]);
+      if (isNaN(id)) return 'Usage: ge collect [offer id]';
+      const result = ge.collectOffer(id);
+      if (!result) return 'Offer not found.';
+      let msg = 'Collected:';
+      if (result.items > 0) {
+        const offer = ge.offers.find(o => o.id === id) || ge.getPlayerOffers(p.id).find(o => o.id === id);
+        const itemName = offer?.itemName || 'items';
+        const def = items.find(itemName);
+        invAdd(p, def?.id || 0, itemName, result.items, def?.stackable);
+        msg += ` ${result.items}x ${itemName}`;
+      }
+      if (result.coins > 0) {
+        invAdd(p, 101, 'Coins', result.coins, true);
+        msg += ` ${result.coins} coins`;
+      }
+      return msg;
+    }
+    if (sub === 'cancel') {
+      const id = parseInt(args[1]);
+      if (isNaN(id)) return 'Usage: ge cancel [offer id]';
+      const result = ge.cancelOffer(id);
+      if (!result) return 'Offer not found.';
+      if (result.refund.items > 0) invAdd(p, result.offer.itemId, result.offer.itemName, result.refund.items, items.get(result.offer.itemId)?.stackable);
+      if (result.refund.coins > 0) invAdd(p, 101, 'Coins', result.refund.coins, true);
+      return `Cancelled. Refunded: ${result.refund.items > 0 ? result.refund.items + 'x ' + result.offer.itemName + ' ' : ''}${result.refund.coins > 0 ? result.refund.coins + ' coins' : ''}`;
+    }
+    if (sub === 'price') {
+      const name = args.slice(1).join(' ');
+      const def = items.find(name);
+      if (!def) return `Unknown item: "${name}"`;
+      const price = ge.getPrice(def.id);
+      return `${def.name}: ${price ? price + ' coins (last trade)' : 'No trades yet'} | Base value: ${def.value} | High alch: ${def.highAlch}`;
+    }
+    return 'Grand Exchange commands:\n  ge buy [item] [qty] [price]\n  ge sell [item] [qty] [price]\n  ge offers\n  ge collect [id]\n  ge cancel [id]\n  ge price [item]';
   }
 });
 
@@ -1133,6 +1393,8 @@ persistence.onSave('areas', () => tiles.saveAreas());
 persistence.onSave('walls', () => walls.saveWalls());
 persistence.onSave('npcs', () => npcs.saveNpcSpawns());
 persistence.onSave('objects', () => objects.saveObjects());
+persistence.onSave('ge', () => ge.saveGE());
+ge.loadGE();
 persistence.startAutoSave();
 
 // Start
