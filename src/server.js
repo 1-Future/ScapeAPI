@@ -2735,8 +2735,8 @@ walls.loadWalls();
 npcs.loadNpcSpawns();
 objects.loadObjects();
 
-// If no chunks loaded, create default content
-if (tiles.tileAt(SPAWN_X, SPAWN_Y) === tiles.T.EMPTY) {
+// If world is empty or objects didn't load, recreate default content
+if (tiles.tileAt(SPAWN_X, SPAWN_Y) === tiles.T.EMPTY || objects.objects.size === 0) {
   console.log('[init] Creating default world...');
   createDefaultContent();
 }
