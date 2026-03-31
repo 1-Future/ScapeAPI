@@ -126,6 +126,24 @@ function createPlayer(id, name) {
 
     // ── Server start time for game clock (feature 10) ──
     // (uses global tick)
+
+    // ── Tutorial system ──
+    tutorialStep: 0, // 0-9, 10 = complete
+    tutorialComplete: false,
+
+    // ── Random events ──
+    nextRandomEvent: 0, // tick when next random event can trigger
+    pendingEvent: null, // { type, data } — current pending random event
+
+    // ── Death tracking / gravestone ──
+    deathCount: 0,
+    gravestone: null, // { x, y, layer, despawnTick }
+
+    // ── Clan system ──
+    clan: null, // clan name string
+
+    // ── Friends list ──
+    friends: [],
   };
 }
 
@@ -145,6 +163,33 @@ function getXp(p, skill) {
   return p.skills[skill]?.xp || 0;
 }
 
+// ── Level-up unlock messages ──
+const LEVEL_UNLOCKS = {
+  woodcutting: { 1: 'You can chop Trees.', 15: 'You can now chop Oak trees.', 30: 'You can now chop Willow trees.', 45: 'You can now chop Maple trees.', 60: 'You can now chop Yew trees.', 75: 'You can now chop Magic trees.', 99: 'You have mastered Woodcutting!' },
+  mining: { 1: 'You can mine Copper and Tin.', 15: 'You can now mine Iron ore.', 30: 'You can now mine Coal.', 40: 'You can now mine Gold ore.', 55: 'You can now mine Mithril ore.', 70: 'You can now mine Adamantite ore.', 85: 'You can now mine Runite ore.', 99: 'You have mastered Mining!' },
+  fishing: { 1: 'You can fish Shrimps.', 20: 'You can now fish Trout.', 40: 'You can now fish Lobster.', 62: 'You can now fish Monkfish.', 76: 'You can now fish Sharks.', 99: 'You have mastered Fishing!' },
+  cooking: { 1: 'You can cook Shrimps.', 15: 'You can now cook Trout.', 30: 'You can now cook Lobster.', 40: 'You can now cook Swordfish.', 80: 'You can now cook Sharks.', 99: 'You have mastered Cooking!' },
+  attack: { 1: 'Bronze weapons.', 5: 'You can now wield Steel weapons.', 10: 'You can now wield Black weapons.', 20: 'You can now wield Mithril weapons.', 30: 'You can now wield Adamant weapons.', 40: 'You can now wield Rune weapons.', 60: 'You can now wield Dragon weapons.', 99: 'You have mastered Attack!' },
+  strength: { 10: 'Your max hit has increased.', 99: 'You have mastered Strength!' },
+  defence: { 1: 'Bronze armour.', 5: 'You can now wear Steel armour.', 10: 'You can now wear Black armour.', 20: 'You can now wear Mithril armour.', 30: 'You can now wear Adamant armour.', 40: 'You can now wear Rune armour.', 60: 'You can now wear Dragon armour.', 99: 'You have mastered Defence!' },
+  ranged: { 1: 'Bronze arrows.', 20: 'You can now use Steel arrows.', 40: 'You can now use Rune arrows.', 99: 'You have mastered Ranged!' },
+  prayer: { 13: 'You can now use Superhuman Strength.', 25: 'You can now use Protect from Melee.', 43: 'You can now use Eagle Eye.', 99: 'You have mastered Prayer!' },
+  magic: { 1: 'Wind Strike.', 25: 'You can now cast Varrock Teleport.', 31: 'You can now cast Lumbridge Teleport.', 55: 'You can now use High Alchemy.', 75: 'You can now cast Charge.', 99: 'You have mastered Magic!' },
+  hitpoints: { 99: 'You have mastered Hitpoints!' },
+  crafting: { 1: 'Basic crafting.', 99: 'You have mastered Crafting!' },
+  smithing: { 1: 'Bronze bars.', 15: 'You can now smelt Iron bars.', 30: 'You can now smelt Steel bars.', 50: 'You can now smelt Mithril bars.', 70: 'You can now smelt Adamant bars.', 85: 'You can now smelt Rune bars.', 99: 'You have mastered Smithing!' },
+  herblore: { 3: 'You can now clean Guam.', 99: 'You have mastered Herblore!' },
+  agility: { 1: 'Town Rooftop Course.', 99: 'You have mastered Agility!' },
+  thieving: { 1: 'Pickpocket Men.', 40: 'You can now pickpocket Guards.', 55: 'You can now pickpocket Knights.', 99: 'You have mastered Thieving!' },
+  fletching: { 99: 'You have mastered Fletching!' },
+  slayer: { 99: 'You have mastered Slayer!' },
+  hunter: { 1: 'Bird snares.', 53: 'You can now use Box traps.', 99: 'You have mastered Hunter!' },
+  firemaking: { 99: 'You have mastered Firemaking!' },
+  farming: { 9: 'You can now plant Guam seeds.', 14: 'You can now plant Marrentill seeds.', 32: 'You can now plant Ranarr seeds.', 99: 'You have mastered Farming!' },
+  runecrafting: { 99: 'You have mastered Runecrafting!' },
+  construction: { 99: 'You have mastered Construction!' },
+};
+
 function addXp(p, skill, amount) {
   if (!p.skills[skill]) return;
   const before = p.skills[skill].level;
@@ -159,6 +204,14 @@ function addXp(p, skill, amount) {
   }
   const after = p.skills[skill].level;
   return after > before ? after : null; // Returns new level if leveled up
+}
+
+function getLevelUpMessage(skill, level) {
+  const unlocks = LEVEL_UNLOCKS[skill];
+  if (!unlocks) return null;
+  // Find the unlock message for this exact level
+  if (unlocks[level]) return unlocks[level];
+  return null;
 }
 
 function totalLevel(p) {
@@ -273,4 +326,5 @@ module.exports = {
   SKILLS, COMBAT_SKILLS, EQUIP_SLOTS, INV_SIZE, BANK_SIZE,
   SPAWN_X, SPAWN_Y,
   XP_TABLE, xpForLevel, levelForXp,
+  getLevelUpMessage, LEVEL_UNLOCKS,
 };

@@ -22,7 +22,8 @@ const objects = require('./world/objects');
 const { createPlayer, combatLevel, getLevel, getXp, addXp, totalLevel,
   getBoostedLevel, calcWeight,
   invAdd, invRemove, invCount, invFreeSlots, SKILLS, EQUIP_SLOTS,
-  SPAWN_X, SPAWN_Y, INV_SIZE, xpForLevel, levelForXp } = require('./player/player');
+  SPAWN_X, SPAWN_Y, INV_SIZE, xpForLevel, levelForXp,
+  getLevelUpMessage } = require('./player/player');
 
 // Combat
 const combat = require('./combat/combat');
@@ -44,6 +45,14 @@ const players = new Map(); // ws → player
 const playersByName = new Map(); // name → player
 const groundItems = []; // [{ id, name, x, y, layer, count, owner, despawnTick }]
 let nextItemId = 1;
+const clans = new Map(); // clanName → { owner, members: Set, name }
+// Load clans from persistence on startup
+const clansFile = persistence.load('clans.json');
+if (clansFile) {
+  for (const [name, data] of Object.entries(clansFile)) {
+    clans.set(name.toLowerCase(), { owner: data.owner, members: new Set(data.members), name: data.name });
+  }
+}
 
 // ── Session Logger ────────────────────────────────────────────────────────────
 const fs = require('fs');
@@ -205,7 +214,8 @@ function combatTick(currentTick) {
       p.pvpTarget = null; p.busy = false;
       sendText(ws, `You have defeated ${target.name}!`);
       // Target dies — same death mechanics
-      sendText(targetWs, `Oh dear, you are dead! Killed by ${p.name}.`);
+      target.deathCount = (target.deathCount || 0) + 1;
+      sendText(targetWs, `Oh dear, you are dead! Killed by ${p.name}. Total deaths: ${target.deathCount}`);
       target.hp = target.maxHp; target.x = SPAWN_X; target.y = SPAWN_Y; target.layer = 0;
       target.combatTarget = null; target.pvpTarget = null; target.busy = false; target.path = [];
       target.prayerPoints = getLevel(target, 'prayer'); target.activePrayers.clear(); target.runEnergy = 10000;
@@ -319,8 +329,20 @@ function combatTick(currentTick) {
 
       // Combat XP
       const xpResult = combatType === 'ranged' ? combat.rangedCombatXp(p, result.damage) : combat.combatXp(p, result.damage);
-      if (xpResult.levelUp) msg += `\n  Level up! ${xpResult.levelUp.skill} → ${xpResult.levelUp.level}`;
-      if (xpResult.hpLevelUp) msg += `\n  Level up! hitpoints → ${xpResult.hpLevelUp.level}`;
+      if (xpResult.levelUp) {
+        const sk = xpResult.levelUp.skill;
+        const lv = xpResult.levelUp.level;
+        const skCap = sk.charAt(0).toUpperCase() + sk.slice(1);
+        const unlock = getLevelUpMessage(sk, lv);
+        msg += `\n  Congratulations! ${skCap} level ${lv}!`;
+        if (unlock) msg += ` ${unlock}`;
+      }
+      if (xpResult.hpLevelUp) {
+        const lv = xpResult.hpLevelUp.level;
+        const unlock = getLevelUpMessage('hitpoints', lv);
+        msg += `\n  Congratulations! Hitpoints level ${lv}!`;
+        if (unlock) msg += ` ${unlock}`;
+      }
     } else {
       // Combat XP even on non-kill hits
       if (combatType === 'ranged') combat.rangedCombatXp(p, result.damage);
@@ -347,6 +369,8 @@ function combatTick(currentTick) {
         }
         if (p.hp <= 0) {
           actions.cancel(p);
+          // Death counter
+          p.deathCount = (p.deathCount || 0) + 1;
           // Death: keep 3 most valuable items, drop the rest
           const deathX = p.x, deathY = p.y, deathLayer = p.layer;
           const allItems = [];
@@ -371,9 +395,13 @@ function combatTick(currentTick) {
           for (const item of kept) {
             invAdd(p, item.id, item.name, item.count || 1, items.get(item.id)?.stackable);
           }
-          // Drop lost items
+          // Drop lost items and set gravestone
+          const gravestoneDespawn = currentTick + 1500;
           for (const item of dropped) {
-            groundItems.push({ id: nextItemId++, name: item.name, count: item.count || 1, x: deathX, y: deathY, layer: deathLayer, owner: p.id, despawnTick: currentTick + 1500 });
+            groundItems.push({ id: nextItemId++, name: item.name, count: item.count || 1, x: deathX, y: deathY, layer: deathLayer, owner: p.id, despawnTick: gravestoneDespawn });
+          }
+          if (dropped.length) {
+            p.gravestone = { x: deathX, y: deathY, layer: deathLayer, despawnTick: gravestoneDespawn };
           }
           let deathMsg = 'Oh dear, you are dead!';
           // HCIM downgrade on death (feature 3)
@@ -383,7 +411,8 @@ function combatTick(currentTick) {
           }
           if (kept.length) deathMsg += `\nYou kept: ${kept.map(i => i.name).join(', ')}`;
           if (dropped.length) deathMsg += `\nYou lost: ${dropped.map(i => i.name).join(', ')}`;
-          deathMsg += '\nYour items are at your gravestone for 15 minutes.';
+          deathMsg += '\nYour items are at your gravestone for 15 minutes. Type `grave` to check.';
+          deathMsg += `\nTotal deaths: ${p.deathCount}`;
           sendText(ws, deathMsg);
           p.hp = p.maxHp;
           p.x = SPAWN_X; p.y = SPAWN_Y; p.layer = 0;
@@ -574,6 +603,39 @@ function worldTick(currentTick) {
     }
   }
 
+  // Random events tick
+  for (const [ws, p] of players) {
+    if (!p.nextRandomEvent) p.nextRandomEvent = currentTick + 500 + Math.floor(Math.random() * 500);
+    if (currentTick >= p.nextRandomEvent && !p.pendingEvent && !p.combatTarget && !p.busy) {
+      const eventRoll = Math.floor(Math.random() * 4);
+      if (eventRoll === 0) {
+        p.pendingEvent = { type: 'genie' };
+        sendText(ws, 'A genie appears! Type `accept genie` for an XP lamp.');
+      } else if (eventRoll === 1) {
+        const a = 1 + Math.floor(Math.random() * 10);
+        const b = 1 + Math.floor(Math.random() * 10);
+        p.pendingEvent = { type: 'quiz', answer: String(a + b), question: `${a}+${b}` };
+        sendText(ws, `A mysterious old man asks: What is ${a}+${b}? Type \`answer ${a + b}\``);
+      } else if (eventRoll === 2) {
+        p.pendingEvent = { type: 'evil_chicken' };
+        sendText(ws, 'An evil chicken attacks! Type `flee` or `attack chicken`.');
+      } else {
+        p.pendingEvent = { type: 'gift' };
+        const giftItems = [
+          { id: 101, name: 'Coins', count: 50 + Math.floor(Math.random() * 200), stackable: true },
+          { id: 200, name: 'Logs', count: 5 },
+          { id: 210, name: 'Copper ore', count: 5 },
+          { id: 104, name: 'Feather', count: 20, stackable: true },
+        ];
+        const gift = giftItems[Math.floor(Math.random() * giftItems.length)];
+        p.pendingEvent = null; // Gift event is instant — no need to track
+        groundItems.push({ id: nextItemId++, name: gift.name, count: gift.count, x: p.x, y: p.y, layer: p.layer, owner: p.id, despawnTick: currentTick + 200 });
+        sendText(ws, `A strange box appears at your feet and bursts open! ${gift.name} x${gift.count} dropped. Type \`pickup ${gift.name.toLowerCase()}\`.`);
+      }
+      p.nextRandomEvent = currentTick + 500 + Math.floor(Math.random() * 500);
+    }
+  }
+
   // Hunter trap check (every 50 ticks)
   if (currentTick % 50 === 0) {
     for (const [ws, p] of players) {
@@ -609,17 +671,65 @@ function worldTick(currentTick) {
 // ── Register Commands ─────────────────────────────────────────────────────────
 
 // General
+// ── Command help examples for `help [command]` ──
+const COMMAND_EXAMPLES = {
+  attack: { usage: 'attack [name]', examples: ['attack chicken', 'attack goblin', 'attack guard'] },
+  chop: { usage: 'chop [tree]', examples: ['chop tree', 'chop oak', 'chop willow'] },
+  mine: { usage: 'mine [rock]', examples: ['mine copper rock', 'mine iron rock', 'mine coal rock'] },
+  fish: { usage: 'fish [spot]', examples: ['fish', 'fish fishing spot', 'fish fly fishing spot'] },
+  cook: { usage: 'cook [item]', examples: ['cook raw shrimps', 'cook raw trout', 'cook'] },
+  eat: { usage: 'eat [food]', examples: ['eat shrimps', 'eat lobster'] },
+  shop: { usage: 'shop [npc]', examples: ['shop shopkeeper', 'shop weapon master', 'shop'] },
+  buy: { usage: 'buy [slot] [amount]', examples: ['buy 0 1', 'buy 3 10'] },
+  sell: { usage: 'sell [item]', examples: ['sell cowhide', 'sell iron ore'] },
+  equip: { usage: 'equip [item]', examples: ['equip bronze sword', 'equip iron platebody'] },
+  bank: { usage: 'bank', examples: ['bank'] },
+  deposit: { usage: 'deposit [item] or deposit all', examples: ['deposit logs', 'deposit all'] },
+  withdraw: { usage: 'withdraw [item] [count]', examples: ['withdraw coins 100', 'withdraw logs'] },
+  goto: { usage: 'goto [x] [y]', examples: ['goto 100 90', 'goto 80 100'] },
+  say: { usage: 'say [message]', examples: ['say hello everyone!'] },
+  pm: { usage: 'pm [player] [message]', examples: ['pm Steve hello there'] },
+  yell: { usage: 'yell [message]', examples: ['yell Selling logs 50gp each!'] },
+  pickup: { usage: 'pickup [item]', examples: ['pickup bones', 'pickup coins'] },
+  drop: { usage: 'drop [item]', examples: ['drop logs', 'drop bones'] },
+  examine: { usage: 'examine [target]', examples: ['examine chicken', 'examine self', 'examine tree'] },
+  cast: { usage: 'cast [spell] or cast [spell] on [npc]', examples: ['cast home teleport', 'cast wind strike on goblin'] },
+  tutorial: { usage: 'tutorial or tutorial skip', examples: ['tutorial', 'tutorial skip'] },
+  actions: { usage: 'actions [target]', examples: ['actions chicken', 'actions tree', 'actions man'] },
+  restore: { usage: 'restore (near a bank)', examples: ['restore'] },
+  uselamp: { usage: 'uselamp [skill]', examples: ['uselamp attack', 'uselamp woodcutting'] },
+  clan: { usage: 'clan create/invite/kick/chat/leave/info [args]', examples: ['clan create Warriors', 'clan invite Steve', 'clan chat hello team'] },
+  grave: { usage: 'grave', examples: ['grave'] },
+  deaths: { usage: 'deaths', examples: ['deaths'] },
+};
+
 commands.register('help', {
-  help: 'Show commands',
+  help: 'Show commands or help for a specific command',
   aliases: ['?', 'commands'],
   category: 'General',
   fn: (p, args) => {
     if (args[0]) {
+      // Check if it's a specific command first
+      const cmdName = args[0].toLowerCase();
+      const cmd = commands.commands.get(cmdName);
+      if (cmd) {
+        let out = `── ${cmdName} ──\n  ${cmd.help}\n`;
+        const ex = COMMAND_EXAMPLES[cmdName];
+        if (ex) {
+          out += `  Usage: ${ex.usage}\n`;
+          out += `  Examples:\n`;
+          for (const e of ex.examples) out += `    ${e}\n`;
+        }
+        if (cmd.aliases && cmd.aliases.length) out += `  Aliases: ${cmd.aliases.join(', ')}\n`;
+        out += `  Category: ${cmd.category}`;
+        return out;
+      }
+      // Otherwise treat as category
       const lines = commands.getHelp(args[0]);
-      return lines.length ? `${args[0]}:\n${lines.join('\n')}` : 'No commands in that category.';
+      return lines.length ? `${args[0]}:\n${lines.join('\n')}` : 'No commands in that category. Try `help [command name]`.';
     }
     const cats = commands.getCategories();
-    let out = 'Categories: ' + cats.join(', ') + '\nType `help [category]` for details.\n\n';
+    let out = 'Categories: ' + cats.join(', ') + '\nType `help [category]` or `help [command]` for details.\n\n';
     for (const cat of cats) {
       const lines = commands.getHelp(cat);
       out += `── ${cat} ──\n${lines.join('\n')}\n\n`;
@@ -1031,7 +1141,12 @@ function startGathering(p, ws, skillName, verb, obj) {
         actions.cancel(data.player);
       }
       let msg = `You get some ${data.obj.product?.name || 'resources'}.${xpDrop(data.skillName, data.obj.xp)}`;
-      if (lvl) msg += ` ${data.skillName} level: ${lvl}!`;
+      if (lvl) {
+        const skillCapital = data.skillName.charAt(0).toUpperCase() + data.skillName.slice(1);
+        const unlock = getLevelUpMessage(data.skillName, lvl);
+        msg += `\nCongratulations! ${skillCapital} level ${lvl}!`;
+        if (unlock) msg += ` ${unlock}`;
+      }
       if (data.obj.depleted) msg += ` The ${data.obj.name} is depleted.`;
       // Track skilling action for achievements/dailies
       events.emit('skill_action', { player: data.player, skill: data.skillName });
@@ -1094,6 +1209,293 @@ commands.register('time', { help: 'Show in-game time', category: 'General',
   }
 });
 
+// ── Yell (broadcast to all players) ──
+commands.register('yell', { help: 'Broadcast to all players: yell [message]', category: 'Social',
+  fn: (p, args, raw) => {
+    const msg = raw.replace(/^yell\s+/i, '');
+    if (!msg) return 'Usage: yell [message]';
+    for (const [ws2] of players) {
+      sendText(ws2, `[YELL] ${p.name}: ${msg}`);
+    }
+    return '';
+  }
+});
+
+// ── Tutorial command ──
+commands.register('tutorial', { help: 'Show tutorial progress or skip', category: 'General',
+  fn: (p, args) => {
+    if (args[0] === 'skip') {
+      p.tutorialStep = 10;
+      p.tutorialComplete = true;
+      addXp(p, 'hitpoints', 500);
+      return 'Tutorial skipped. +500 hitpoints XP. Type `help` for commands.';
+    }
+    if (p.tutorialComplete) return 'Tutorial complete! You finished all steps.';
+    const steps = [
+      "Step 0: Type `look` to see your surroundings.",
+      "Step 1: Type `n` to walk north.",
+      "Step 2: Type `skills` to see your stats.",
+      "Step 3: Find a chicken and type `attack chicken`.",
+      "Step 4: Type `inv` to check your inventory for loot.",
+      "Step 5: Try `chop tree` near a tree to gather logs.",
+      "Step 6: Try `mine copper rock` near some rocks.",
+      "Step 7: Use `nearby` to see what's around you.",
+      "Step 8: Head to town with `goto 100 90` and visit the shops.",
+      "Step 9: Tutorial nearly done!",
+    ];
+    return `── Tutorial (${p.tutorialStep}/9) ──\n${steps[p.tutorialStep] || 'Complete!'}\nType \`tutorial skip\` to skip.`;
+  }
+});
+
+// ── Deaths command ──
+commands.register('deaths', { help: 'Show death count', category: 'General',
+  fn: (p) => `Total deaths: ${p.deathCount || 0}`
+});
+
+// ── Gravestone command ──
+commands.register('grave', { help: 'Show gravestone location', aliases: ['gravestone'], category: 'General',
+  fn: (p) => {
+    if (!p.gravestone) return 'You have no active gravestone.';
+    const currentTick = tick.getTick();
+    const ticksLeft = p.gravestone.despawnTick - currentTick;
+    if (ticksLeft <= 0) {
+      p.gravestone = null;
+      return 'Your gravestone has crumbled. The items are gone.';
+    }
+    const secondsLeft = Math.floor(ticksLeft * 0.6);
+    const minutesLeft = Math.floor(secondsLeft / 60);
+    const secsLeft = secondsLeft % 60;
+    return `Your gravestone is at (${p.gravestone.x}, ${p.gravestone.y}) Layer ${p.gravestone.layer}.\nTime remaining: ${minutesLeft}m ${secsLeft}s (${ticksLeft} ticks).\nHurry back to reclaim your items!`;
+  }
+});
+
+// ── Restore command (at bank) ──
+commands.register('restore', { help: 'Restore HP, prayer, energy at a bank', category: 'General',
+  fn: (p) => {
+    const booth = objects.findObjectByName('bank booth', p.x, p.y, 3, p.layer);
+    if (!booth) return 'You need to be near a bank booth to restore your stats.';
+    p.hp = p.maxHp;
+    p.prayerPoints = getLevel(p, 'prayer');
+    p.runEnergy = 10000;
+    p.poison = null;
+    p.stunTicks = 0;
+    p.boosts = {};
+    return `Stats restored! HP: ${p.hp}/${p.maxHp}, Prayer: ${p.prayerPoints}/${getLevel(p, 'prayer')}, Energy: 100%. Poison cleared.`;
+  }
+});
+
+// ── Actions command (context menu) ──
+commands.register('actions', { help: 'Show available actions for a target: actions [target]', category: 'World',
+  fn: (p, args) => {
+    const name = args.join(' ').toLowerCase();
+    if (!name) return 'Usage: actions [target]. E.g., actions chicken';
+    // Check NPCs
+    const npc = npcs.findNpcByName(name, p.x, p.y, 15, p.layer);
+    if (npc) {
+      const npcDef = npcs.npcDefs.get(npc.defId);
+      const actionsList = ['examine'];
+      if (npc.combat > 0) actionsList.unshift('attack');
+      if (npc.dialogue) actionsList.push('talk');
+      if (npcDef?.thieving) actionsList.push('pickpocket');
+      const shop = require('./data/shops').findByNpc(npc.name);
+      if (shop) actionsList.push('shop');
+      return `── ${npc.name} ──\nActions: ${actionsList.join(', ')}`;
+    }
+    // Check objects
+    const obj = objects.findObjectByName(name, p.x, p.y, 15, p.layer);
+    if (obj) {
+      const objDef = objects.objectDefs.get(obj.defId);
+      const actionsList = ['examine'];
+      if (objDef?.actions) actionsList.push(...objDef.actions);
+      return `── ${obj.name} ──\nActions: ${actionsList.join(', ')}`;
+    }
+    // Check players
+    const target = findPlayer(name);
+    if (target && target !== p) {
+      const actionsList = ['examine', 'trade', 'pm', 'friend add'];
+      const area = tiles.getArea(p.x, p.y, p.layer);
+      if (area && area.pvp) actionsList.push('attack');
+      return `── ${target.name} ──\nActions: ${actionsList.join(', ')}`;
+    }
+    // Check ground items
+    const gItem = groundItems.find(i => i.name.toLowerCase() === name && Math.abs(i.x - p.x) <= 3 && Math.abs(i.y - p.y) <= 3 && i.layer === p.layer);
+    if (gItem) return `── ${gItem.name} ──\nActions: pickup, examine`;
+    return `Nothing called "${name}" nearby.`;
+  }
+});
+
+// ── Dismiss random event ──
+commands.register('dismiss', { help: 'Dismiss a random event', category: 'General',
+  fn: (p) => {
+    if (!p.pendingEvent) return 'No random event to dismiss.';
+    p.pendingEvent = null;
+    return 'You dismiss the random event.';
+  }
+});
+
+// ── Answer random event quiz ──
+commands.register('answer', { help: 'Answer a quiz random event: answer [number]', category: 'General',
+  fn: (p, args) => {
+    if (!p.pendingEvent || p.pendingEvent.type !== 'quiz') return 'There is no quiz to answer.';
+    const answer = args.join('').trim();
+    if (answer === p.pendingEvent.answer) {
+      const reward = 50 + Math.floor(Math.random() * 200);
+      invAdd(p, 101, 'Coins', reward, true);
+      p.pendingEvent = null;
+      return `Correct! The old man rewards you with ${reward} coins.`;
+    }
+    p.pendingEvent = null;
+    return 'Wrong answer! The old man vanishes.';
+  }
+});
+
+// ── Accept random event (genie) ──
+commands.register('accept', { help: 'Accept a random event reward: accept genie', category: 'General',
+  fn: (p, args) => {
+    const what = args.join(' ').toLowerCase();
+    if (what !== 'genie') return 'Usage: accept genie';
+    if (!p.pendingEvent || p.pendingEvent.type !== 'genie') return 'There is no genie to accept.';
+    // Give XP lamp based on player level
+    const lampId = 950; // small lamp
+    invAdd(p, lampId, 'XP lamp (small)', 1);
+    p.pendingEvent = null;
+    return 'The genie grants you an XP lamp! Use it with `uselamp [skill]`.';
+  }
+});
+
+// ── Clan system ──
+commands.register('clan', { help: 'Clan commands: clan create/invite/kick/chat/leave/info [args]', category: 'Social',
+  fn: (p, args) => {
+    const sub = args[0]?.toLowerCase();
+    if (!sub) {
+      if (!p.clan) return 'You are not in a clan. Type `clan create [name]` to create one.';
+      const clan = clans.get(p.clan.toLowerCase());
+      if (!clan) { p.clan = null; return 'Your clan no longer exists.'; }
+      let out = `── Clan: ${clan.name} ──\n`;
+      out += `Owner: ${clan.owner}\n`;
+      out += `Members (${clan.members.size}): ${[...clan.members].join(', ')}`;
+      return out;
+    }
+
+    if (sub === 'create') {
+      const clanName = args.slice(1).join(' ');
+      if (!clanName) return 'Usage: clan create [name]';
+      if (p.clan) return 'You are already in a clan. Leave first with `clan leave`.';
+      if (clans.has(clanName.toLowerCase())) return 'A clan with that name already exists.';
+      const members = new Set([p.name]);
+      clans.set(clanName.toLowerCase(), { owner: p.name, members, name: clanName });
+      p.clan = clanName;
+      saveClanData();
+      return `Clan "${clanName}" created! You are the owner.`;
+    }
+
+    if (sub === 'invite') {
+      const targetName = args.slice(1).join(' ');
+      if (!targetName) return 'Usage: clan invite [player]';
+      if (!p.clan) return 'You are not in a clan.';
+      const clan = clans.get(p.clan.toLowerCase());
+      if (!clan) return 'Your clan no longer exists.';
+      if (clan.owner !== p.name) return 'Only the clan owner can invite players.';
+      const target = findPlayer(targetName);
+      if (!target) return `Player "${targetName}" not found online.`;
+      if (target.clan) return `${target.name} is already in a clan.`;
+      clan.members.add(target.name);
+      target.clan = clan.name;
+      saveClanData();
+      // Notify target
+      for (const [ws2, pl] of players) {
+        if (pl === target) { sendText(ws2, `You have been invited to clan "${clan.name}" by ${p.name}.`); break; }
+      }
+      return `${target.name} has been added to the clan.`;
+    }
+
+    if (sub === 'kick') {
+      const targetName = args.slice(1).join(' ');
+      if (!targetName) return 'Usage: clan kick [player]';
+      if (!p.clan) return 'You are not in a clan.';
+      const clan = clans.get(p.clan.toLowerCase());
+      if (!clan) return 'Your clan no longer exists.';
+      if (clan.owner !== p.name) return 'Only the clan owner can kick players.';
+      if (targetName.toLowerCase() === p.name.toLowerCase()) return "You can't kick yourself.";
+      const removed = [...clan.members].find(m => m.toLowerCase() === targetName.toLowerCase());
+      if (!removed) return `${targetName} is not in your clan.`;
+      clan.members.delete(removed);
+      // Clear their clan reference if online
+      const target = findPlayer(removed);
+      if (target) {
+        target.clan = null;
+        for (const [ws2, pl] of players) {
+          if (pl === target) { sendText(ws2, `You have been kicked from clan "${clan.name}".`); break; }
+        }
+      }
+      saveClanData();
+      return `${removed} has been kicked from the clan.`;
+    }
+
+    if (sub === 'chat' || sub === 'c') {
+      const msg = args.slice(1).join(' ');
+      if (!msg) return 'Usage: clan chat [message]';
+      if (!p.clan) return 'You are not in a clan.';
+      const clan = clans.get(p.clan.toLowerCase());
+      if (!clan) return 'Your clan no longer exists.';
+      for (const [ws2, pl] of players) {
+        if (pl.clan && pl.clan.toLowerCase() === p.clan.toLowerCase()) {
+          sendText(ws2, `[Clan] ${p.name}: ${msg}`);
+        }
+      }
+      return '';
+    }
+
+    if (sub === 'leave') {
+      if (!p.clan) return 'You are not in a clan.';
+      const clan = clans.get(p.clan.toLowerCase());
+      if (clan) {
+        if (clan.owner === p.name) {
+          // Owner leaving disbands the clan
+          for (const member of clan.members) {
+            const pl = findPlayer(member);
+            if (pl) {
+              pl.clan = null;
+              for (const [ws2, p2] of players) {
+                if (p2 === pl && pl !== p) sendText(ws2, `The clan "${clan.name}" has been disbanded.`);
+              }
+            }
+          }
+          clans.delete(p.clan.toLowerCase());
+        } else {
+          clan.members.delete(p.name);
+        }
+        saveClanData();
+      }
+      const clanName = p.clan;
+      p.clan = null;
+      return `You left the clan "${clanName}".`;
+    }
+
+    if (sub === 'info') {
+      const clanName = args.slice(1).join(' ');
+      if (!clanName && !p.clan) return 'Usage: clan info [name]';
+      const lookupName = clanName || p.clan;
+      const clan = clans.get(lookupName.toLowerCase());
+      if (!clan) return `Clan "${lookupName}" not found.`;
+      let out = `── Clan: ${clan.name} ──\n`;
+      out += `Owner: ${clan.owner}\n`;
+      out += `Members (${clan.members.size}): ${[...clan.members].join(', ')}`;
+      return out;
+    }
+
+    return 'Clan commands: create, invite, kick, chat, leave, info';
+  }
+});
+
+function saveClanData() {
+  const data = {};
+  for (const [key, clan] of clans) {
+    data[key] = { owner: clan.owner, members: [...clan.members], name: clan.name };
+  }
+  persistence.save('clans.json', data);
+}
+
 commands.register('stop', { help: 'Stop current action', aliases: ['cancel'], category: 'General',
   fn: (p) => {
     if (!p.busy && !actions.isActive(p) && !p.combatTarget && !p.pvpTarget) return 'You aren\'t doing anything.';
@@ -1106,10 +1508,16 @@ commands.register('stop', { help: 'Stop current action', aliases: ['cancel'], ca
 });
 
 // Chat
-commands.register('say', { help: 'Public chat', aliases: ['chat'], category: 'Social',
+commands.register('say', { help: 'Public chat: say [message]', aliases: ['chat'], category: 'Social',
   fn: (p, args, raw) => {
     const msg = raw.replace(/^(say|chat)\s+/i, '');
     broadcast({ t: 'chat', from: p.name, msg });
+    // Overhead chat: nearby players see the message with player name
+    for (const [ws2, pl] of players) {
+      if (pl !== p && Math.abs(pl.x - p.x) <= 10 && Math.abs(pl.y - p.y) <= 10 && pl.layer === p.layer) {
+        sendText(ws2, `[${p.name}]: ${msg}`);
+      }
+    }
     return `You say: ${msg}`;
   }
 });
@@ -1921,13 +2329,33 @@ wss.on('connection', (ws) => {
 
       // Load saved player data
       const saved = persistence.load(`players/${name.toLowerCase()}.json`);
+      let isNewPlayer = true;
       if (saved) {
+        isNewPlayer = false;
         Object.assign(p, saved);
         p.connected = true;
         p.path = [];
+        p.busy = false;
+        p.busyAction = null;
+        p.combatTarget = null;
+        p.pvpTarget = null;
         // Restore Sets from arrays after JSON load
         if (Array.isArray(p.activePrayers)) p.activePrayers = new Set(p.activePrayers);
         else if (!(p.activePrayers instanceof Set)) p.activePrayers = new Set();
+        // Restore collectionLog arrays
+        if (p.collectionLog) {
+          for (const key of Object.keys(p.collectionLog)) {
+            if (p.collectionLog[key] instanceof Set) {
+              // Already a set somehow, convert back
+            } else if (!Array.isArray(p.collectionLog[key])) {
+              p.collectionLog[key] = [];
+            }
+          }
+        }
+        // Restore agilityLap Set
+        if (p.agilityLap && Array.isArray(p.agilityLap.obstaclesDone)) {
+          p.agilityLap.obstaclesDone = new Set(p.agilityLap.obstaclesDone);
+        }
       }
 
       // Initialize new feature fields if missing (for existing saves)
@@ -1937,6 +2365,13 @@ wss.on('connection', (ws) => {
       if (!p.collectionLog) p.collectionLog = {};
       if (!p.lootTracker) p.lootTracker = {};
       p.lootTrackerTotal = 0; // Reset session loot tracker on login
+      if (p.deathCount === undefined) p.deathCount = 0;
+      if (p.tutorialStep === undefined) p.tutorialStep = 0;
+      if (p.tutorialComplete === undefined) p.tutorialComplete = false;
+      if (!p.friends) p.friends = [];
+      // Initialize random event timer
+      p.nextRandomEvent = tick.getTick() + 500 + Math.floor(Math.random() * 500);
+      p.pendingEvent = null;
 
       p.admin = true; // Everyone is admin for now (build mode)
       p.loginTick = tick.getTick();
@@ -1948,6 +2383,10 @@ wss.on('connection', (ws) => {
       const modeIcon = p.accountMode === 'ironman' ? ' [Ironman]' : p.accountMode === 'hcim' ? ' [Hardcore Ironman]' : p.accountMode === 'uim' ? ' [Ultimate Ironman]' : '';
       sendText(ws, `Logged in as ${name}${modeIcon}. Combat level: ${combatLevel(p)}. Type \`help\` for commands.\nYou are at (${p.x}, ${p.y}).`);
       if (!p.modeSet) sendText(ws, 'Tip: Set your account mode with `mode ironman/hcim/uim` (one-time choice).');
+      // Tutorial for new players
+      if (!p.tutorialComplete && p.tutorialStep === 0) {
+        sendText(ws, '── Tutorial ──\nWelcome! Type `look` to see your surroundings. (Type `tutorial skip` to skip the tutorial.)');
+      }
       sendText(ws, commands.execute(p, 'look'));
       events.emit('player_login', { player: p, ws });
 
@@ -1990,6 +2429,65 @@ wss.on('connection', (ws) => {
     }
     const result = commands.execute(p, input);
     if (result) sendText(ws, result);
+
+    // ── Tutorial step tracking ──
+    if (!p.tutorialComplete && p.tutorialStep < 10) {
+      const parsed = commands.parse(input);
+      if (parsed) {
+        const verb = parsed.verb;
+        let advanced = false;
+        if (p.tutorialStep === 0 && (verb === 'look' || verb === 'l')) advanced = true;
+        else if (p.tutorialStep === 1 && verb === 'n') advanced = true;
+        else if (p.tutorialStep === 2 && (verb === 'skills' || verb === 'stats')) advanced = true;
+        else if (p.tutorialStep === 3 && (verb === 'attack' || verb === 'fight' || verb === 'kill')) advanced = true;
+        else if (p.tutorialStep === 4 && (verb === 'inventory' || verb === 'inv' || verb === 'i')) advanced = true;
+        else if (p.tutorialStep === 5 && verb === 'chop') advanced = true;
+        else if (p.tutorialStep === 6 && verb === 'mine') advanced = true;
+        else if (p.tutorialStep === 7 && verb === 'nearby') advanced = true;
+        else if (p.tutorialStep === 8 && (verb === 'goto' || verb === 'shop')) advanced = true;
+        if (advanced) {
+          p.tutorialStep++;
+          // Award small XP reward per step
+          const tutorialXpRewards = [
+            { skill: 'hitpoints', amount: 25 },   // step 0->1: look
+            { skill: 'agility', amount: 25 },      // step 1->2: walk
+            null,                                   // step 2->3: skills (no xp)
+            { skill: 'attack', amount: 50 },        // step 3->4: attack
+            null,                                   // step 4->5: inv (no xp)
+            { skill: 'woodcutting', amount: 50 },   // step 5->6: chop
+            { skill: 'mining', amount: 50 },        // step 6->7: mine
+            null,                                   // step 7->8: nearby (no xp)
+            { skill: 'hitpoints', amount: 100 },    // step 8->9: goto/shop
+          ];
+          const reward = tutorialXpRewards[p.tutorialStep - 1];
+          let rewardMsg = '';
+          if (reward) {
+            addXp(p, reward.skill, reward.amount);
+            rewardMsg = ` (+${reward.amount} ${reward.skill} XP)`;
+          }
+          const tutorialMessages = [
+            null, // step 0 (handled on login)
+            "Great! Now type `n` to walk north.",
+            "You moved! Type `skills` to see your stats.",
+            "Now find a chicken and type `attack chicken`.",
+            "Nice! Type `inv` to check your inventory for loot.",
+            "Try `chop tree` near a tree to gather logs.",
+            "Now try `mine copper rock` near some rocks.",
+            "Use `nearby` to see what's around you.",
+            "Head to town with `goto 100 90` and visit the shops with `shop shopkeeper`.",
+            "Tutorial complete! Type `help` anytime. Explore the world!",
+          ];
+          if (p.tutorialStep >= 9) {
+            p.tutorialStep = 10;
+            p.tutorialComplete = true;
+            addXp(p, 'hitpoints', 200);
+            sendText(ws, `Tutorial complete! Type \`help\` anytime. Explore the world! (+200 hitpoints XP)`);
+          } else {
+            sendText(ws, `[Tutorial]${rewardMsg} ${tutorialMessages[p.tutorialStep]}`);
+          }
+        }
+      }
+    }
   });
 
   ws.on('close', () => {
@@ -2000,11 +2498,32 @@ wss.on('connection', (ws) => {
       const saveData = { ...p };
       delete saveData.path;
       delete saveData.connected;
-      // Session-only fields (feature 8) — don't persist loot tracker
+      // Session-only fields — don't persist loot tracker or pending events
       delete saveData.lootTracker;
       delete saveData.lootTrackerTotal;
+      delete saveData.pendingEvent;
+      delete saveData._bankOpen;
+      delete saveData._currentShop;
+      delete saveData._pendingGather;
+      delete saveData._lastWildyCheck;
+      delete saveData.pvpTarget;
+      delete saveData.combatTarget;
+      delete saveData.busy;
+      delete saveData.busyAction;
       // Convert Sets to arrays for JSON serialization
       if (saveData.activePrayers instanceof Set) saveData.activePrayers = [...saveData.activePrayers];
+      // Convert collectionLog arrays (ensure they're plain arrays)
+      if (saveData.collectionLog) {
+        for (const key of Object.keys(saveData.collectionLog)) {
+          if (saveData.collectionLog[key] instanceof Set) {
+            saveData.collectionLog[key] = [...saveData.collectionLog[key]];
+          }
+        }
+      }
+      // Convert agilityLap Set
+      if (saveData.agilityLap && saveData.agilityLap.obstaclesDone instanceof Set) {
+        saveData.agilityLap.obstaclesDone = [...saveData.agilityLap.obstaclesDone];
+      }
       persistence.save(`players/${p.name.toLowerCase()}.json`, saveData);
       playersByName.delete(p.name.toLowerCase());
       players.delete(ws);
@@ -2041,6 +2560,7 @@ registerAllCommands({
   getBoostedLevel, calcWeight,
   invAdd, invRemove, invCount, invFreeSlots,
   send, sendText, broadcast, findPlayer, nextItemId,
+  getLevelUpMessage, clans,
 });
 
 // Persistence
@@ -2050,6 +2570,7 @@ persistence.onSave('walls', () => walls.saveWalls());
 persistence.onSave('npcs', () => npcs.saveNpcSpawns());
 persistence.onSave('objects', () => objects.saveObjects());
 persistence.onSave('ge', () => ge.saveGE());
+persistence.onSave('clans', () => saveClanData());
 ge.loadGE();
 persistence.startAutoSave();
 

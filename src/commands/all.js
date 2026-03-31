@@ -15,11 +15,35 @@ module.exports = function registerAll(ctx) {
     getLevel, getXp, addXp, totalLevel, combatLevel,
     getBoostedLevel, calcWeight,
     invAdd, invRemove, invCount, invFreeSlots,
-    send, sendText, broadcast, findPlayer, nextItemId } = ctx;
+    send, sendText, broadcast, findPlayer, nextItemId,
+    getLevelUpMessage, clans } = ctx;
 
   // Helper: recalculate player weight
   function updateWeight(p) {
     if (calcWeight) calcWeight(p, (id) => items.get(id));
+  }
+
+  // Helper: format level-up message with unlocks
+  function levelUpMsg(skill, level) {
+    const skillName = skill.charAt(0).toUpperCase() + skill.slice(1);
+    let msg = `\nCongratulations! ${skillName} level ${level}!`;
+    if (getLevelUpMessage) {
+      const unlock = getLevelUpMessage(skill, level);
+      if (unlock) msg += ` ${unlock}`;
+    }
+    // Broadcast milestone level-ups (every 10 levels or 99)
+    if (level % 10 === 0 || level === 99) {
+      // Notify nearby players
+      for (const [w, pl] of players) {
+        for (const [w2, pl2] of players) {
+          if (pl2 !== pl && Math.abs(pl2.x - pl.x) <= 15 && Math.abs(pl2.y - pl.y) <= 15) {
+            // We can't easily get the leveling player here, so we skip broadcast in this helper
+          }
+        }
+        break;
+      }
+    }
+    return msg;
   }
 
   // Helper: compact skill name for XP drops (feature 11)
@@ -88,7 +112,7 @@ module.exports = function registerAll(ctx) {
       updateWeight(p);
       const lvl = addXp(p, 'prayer', xp);
       let msg = `You bury the ${item.name}.${xpDrop('prayer', xp)}`;
-      if (lvl) msg += ` Prayer level: ${lvl}!`;
+      if (lvl) msg += levelUpMsg('prayer', lvl);
       events.emit('skill_action', { player: p, skill: 'prayer' });
       return msg;
     }
@@ -116,7 +140,7 @@ module.exports = function registerAll(ctx) {
         updateWeight(p);
         const lvl = addXp(p, 'prayer', xp);
         let msg = `You offer the ${item.name} to the altar.${xpDrop('prayer', xp)}`;
-        if (lvl) msg += ` Prayer level: ${lvl}!`;
+        if (lvl) msg += levelUpMsg('prayer', lvl);
         return msg;
       }
 
@@ -179,7 +203,7 @@ module.exports = function registerAll(ctx) {
         const lvl = addXp(pl, data.skill, r.xp);
         updateWeight(pl);
         let msg = `You ${data.verb} ${r.name}.${xpDrop(data.skill, r.xp)}`;
-        if (lvl) msg += ` ${data.skill.charAt(0).toUpperCase() + data.skill.slice(1)} level: ${lvl}!`;
+        if (lvl) msg += levelUpMsg(data.skill, lvl);
         // Track skilling action for achievements/dailies
         events.emit('skill_action', { player: pl, skill: data.skill });
         // Can we repeat?
@@ -310,7 +334,7 @@ module.exports = function registerAll(ctx) {
       invAdd(p, 101, 'Coins', value, true);
       const lvl = addXp(p, 'magic', 65);
       let msg = `You alch the ${item.name} for ${value} coins.${xpDrop('magic', 65)}`;
-      if (lvl) msg += ` Magic level: ${lvl}!`;
+      if (lvl) msg += levelUpMsg('magic', lvl);
       return msg;
     }
   });
@@ -723,11 +747,11 @@ module.exports = function registerAll(ctx) {
           }
           pl.agilityLap.obstaclesDone.add(data.obstacleIdx);
           let msg = `You cross the ${data.obstacle.name}.${xpDrop('agility', data.obstacle.xp)}`;
-          if (lvl) msg += ` Agility level: ${lvl}!`;
+          if (lvl) msg += levelUpMsg('agility', lvl);
           if (pl.agilityLap.obstaclesDone.size >= data.course.obstacles.length) {
             const lapLvl = addXp(pl, 'agility', data.course.lapBonus);
             msg += `\nLap complete!${xpDrop('agility', data.course.lapBonus)}`;
-            if (lapLvl) msg += ` Agility level: ${lapLvl}!`;
+            if (lapLvl) msg += levelUpMsg('agility', lapLvl);
             events.emit('skill_action', { player: pl, skill: 'agility' });
             pl.agilityLap = null;
           } else {
@@ -767,7 +791,7 @@ module.exports = function registerAll(ctx) {
         const lvl = addXp(p, 'thieving', thieving.xp);
         updateWeight(p);
         let msg = `You pick the ${npc.name}'s pocket. Got: ${loot.name} x${count}.${xpDrop('thieving', thieving.xp)}`;
-        if (lvl) msg += ` Thieving level: ${lvl}!`;
+        if (lvl) msg += levelUpMsg('thieving', lvl);
         events.emit('skill_action', { player: p, skill: 'thieving' });
         return msg;
       } else {
@@ -1127,7 +1151,7 @@ module.exports = function registerAll(ctx) {
       };
       const lvl = addXp(p, 'farming', seedInfo.xp);
       let msg = `You plant the ${item.name} in the patch.${xpDrop('farming', seedInfo.xp)}`;
-      if (lvl) msg += ` Farming level: ${lvl}!`;
+      if (lvl) msg += levelUpMsg('farming', lvl);
       return msg;
     }
   });
@@ -1153,7 +1177,7 @@ module.exports = function registerAll(ctx) {
       updateWeight(p);
       delete p.farmingPatches[patchKey];
       let msg = `You harvest ${added}x ${patch.herbName} from the patch.${xpDrop('farming', harvestXp)}`;
-      if (lvl) msg += ` Farming level: ${lvl}!`;
+      if (lvl) msg += levelUpMsg('farming', lvl);
       return msg;
     }
   });
@@ -1254,7 +1278,7 @@ module.exports = function registerAll(ctx) {
           }
           updateWeight(p);
           out += `  ${trap.type} at (${trap.x}, ${trap.y}) — Caught ${trap.caught}!${xpDrop('hunter', trap.xp)}`;
-          if (lvl) out += ` Hunter level: ${lvl}!`;
+          if (lvl) out += levelUpMsg('hunter', lvl);
           out += '\n';
           p.traps.splice(i, 1);
           collectedAny = true;
@@ -1339,7 +1363,7 @@ module.exports = function registerAll(ctx) {
             updateWeight(pl);
             pl.x = 100; pl.y = 88; pl.layer = 0; pl.path = [];
             let msg = `You teleport to Town!${xpDrop('magic', 35)}`;
-            if (lvl) msg += ` Magic level: ${lvl}!`;
+            if (lvl) msg += levelUpMsg('magic', lvl);
             return msg;
           },
         });
@@ -1364,7 +1388,7 @@ module.exports = function registerAll(ctx) {
             updateWeight(pl);
             pl.x = 100; pl.y = 100; pl.layer = 0; pl.path = [];
             let msg = `You teleport to Lumbridge!${xpDrop('magic', 41)}`;
-            if (lvl) msg += ` Magic level: ${lvl}!`;
+            if (lvl) msg += levelUpMsg('magic', lvl);
             return msg;
           },
         });
@@ -2089,20 +2113,25 @@ module.exports = function registerAll(ctx) {
   commands.register('uselamp', { help: 'Use XP lamp: uselamp [skill]', category: 'Items',
     fn: (p, args) => {
       const skill = (args[0] || '').toLowerCase();
-      const { SKILLS } = require('../player/player');
+      const { SKILLS, getLevelUpMessage } = require('../player/player');
       if (!SKILLS.includes(skill)) return `Usage: uselamp [skill]. Skills: ${SKILLS.join(', ')}`;
-      // Find lamp in inventory (check large, medium, small)
-      const lampIds = [952, 951, 950];
-      const lampXp = { 950: 1000, 951: 5000, 952: 15000 };
-      const lampNames = { 950: 'small', 951: 'medium', 952: 'large' };
+      // Find lamp in inventory (check large, medium, small, generic)
+      const lampIds = [952, 951, 950, 953];
+      const lampMultipliers = { 950: 1, 951: 3, 952: 10, 953: 1 };
+      const lampNames = { 950: 'small', 951: 'medium', 952: 'large', 953: 'experience' };
       for (const lid of lampIds) {
         const slot = p.inventory.findIndex(s => s && s.id === lid);
         if (slot >= 0) {
-          const xp = lampXp[lid];
+          const level = getLevel(p, skill);
+          const xp = level * 100 * (lampMultipliers[lid] || 1);
           p.inventory[slot] = p.inventory[slot].count > 1 ? { ...p.inventory[slot], count: p.inventory[slot].count - 1 } : null;
           const lvl = addXp(p, skill, xp);
           let msg = `You rub the XP lamp (${lampNames[lid]}). +${xp.toLocaleString()} ${skill} XP!`;
-          if (lvl) msg += ` ${skill} level: ${lvl}!`;
+          if (lvl) {
+            msg += ` ${skill.charAt(0).toUpperCase() + skill.slice(1)} level: ${lvl}!`;
+            const unlock = getLevelUpMessage ? getLevelUpMessage(skill, lvl) : null;
+            if (unlock) msg += ` ${unlock}`;
+          }
           return msg;
         }
       }
